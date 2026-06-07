@@ -1,0 +1,26 @@
+project:
+  type: default
+  output-dir: .
+
+lang: es
+author: César Cárdenas
+
+format:
+  revealjs:
+    theme: [moon, styles/custom.scss]
+    transition: slide
+    background-transition: fade
+    slide-number: true
+    progress: true
+    controls: true
+    chalkboard: true
+    footer: "César Cárdenas · Cuando los datos deben fluir"
+    code-fold: true
+    auto-stretch: false
+    center: false
+    navigationMode: vertical
+    controls-tutorial: true
+    controls-layout: bottom-right
+    mermaid:
+      theme: dark
+    highlight-style: monokai

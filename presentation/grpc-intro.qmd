@@ -1,0 +1,389 @@
+---
+title: "Cuando los datos deben fluir entre servicios"
+subtitle: "De cubetas a cañería — gRPC en vivo"
+author: "César Cárdenas"
+date: today
+format:
+  revealjs:
+    theme: [moon, styles/custom.scss]
+    transition: slide
+    background-transition: fade
+    slide-number: true
+    progress: true
+    controls: true
+    chalkboard: true
+    footer: "César Cárdenas · Cuando los datos deben fluir"
+    code-fold: true
+    navigationMode: vertical
+    controls-tutorial: true
+    controls-layout: bottom-right
+    auto-stretch: false
+    center: false
+    mermaid:
+      theme: dark
+    highlight-style: monokai
+---
+
+## Agenda
+
+::: {.incremental}
+1. Un flujo de datos por estaciones
+2. gRPC: la cañería continua
+3. REST vs gRPC — cubetas, envases y cañería
+4. Cuándo conviene cada enfoque
+5. Demo `rpc_demo`: la misma agua, distinto transporte
+6. Conclusiones
+:::
+
+::: {.notes}
+Una sola metáfora de principio a fin: líquido = datos, estaciones = servicios, panel = UI. Duración hilo principal: 15–20 min. Profundizaciones con ↓.
+:::
+
+# El problema
+
+Un **flujo continuo de datos** (como un líquido) debe pasar por **varias estaciones**: leer, transformar, reportar progreso.
+
+::: {.incremental}
+1. **La cubeta** — recibo un balde, proceso, devuelvo otro balde. Simple, pero pesado y difícil de observar en vivo.
+2. **Los envases** — reparto en porciones; alguien lleva cada envase estación por estación.
+3. **La cañería** — flujo sin cortes; cada estación transforma mientras el líquido avanza.
+:::
+
+::: {.fragment}
+La demo procesa ~50 000 transacciones: **la misma agua**, tres formas de transportarla.
+:::
+
+::: {.depth-hint .fragment}
+Profundización opcional ↓ — ¿qué es RPC?
+:::
+
+::: {.notes}
+Ejemplo concreto: millones de transacciones bancarias que deben atravesar ingesta, reglas y reporting. No digas “apps que se hablan”; mantén el líquido.
+:::
+
+## ¿Qué es RPC?
+
+RPC es cómo una estación **invoca** el trabajo de otra sin ir a buscar la cubeta en persona.
+
+**RPC** (*Remote Procedure Call*) = llamar a una función en **otro programa**, como si estuviera en el tuyo.
+
+::: {.mermaid-compact}
+```{mermaid}
+flowchart LR
+  EstA[Estacion_A] -->|"peticion"| Red[Red]
+  Red --> EstB[Estacion_B]
+  EstB -->|"respuesta"| Red
+  Red --> EstA
+```
+:::
+
+::: {.small}
+Para quien programa, la experiencia se parece a invocar una función local.
+:::
+
+# gRPC en una frase
+
+**gRPC** es RPC moderno (Google) pensado para **caudal continuo** entre estaciones:
+
+::: {.incremental}
+1. **Contrato `.proto`** — plano de la tubería (estaciones, entradas, salidas)
+2. **Mensajes compactos** — menos fricción en el conducto
+3. **HTTP/2 + streaming** — cañería de alto caudal, no envases sueltos
+:::
+
+::: {.depth-hint .fragment}
+Profundización opcional ↓ — el plano `.proto`
+:::
+
+::: {.notes}
+El `.proto` es el “plano de la planta”, no un documento informal. No profundices en protobuf binario.
+:::
+
+## El contrato `.proto`
+
+Define **qué estaciones existen** y qué entra/sale de cada una; todos comparten el mismo plano.
+
+::: {.mermaid-compact}
+```{mermaid}
+flowchart TB
+  Proto["pipeline.proto"]
+  Proto --> Gen[Generador]
+  Gen --> SvcA[Ingest]
+  Gen --> SvcB[Transform]
+  Gen --> SvcC[Gateway]
+```
+:::
+
+::: {.small}
+Mismo plano, distintos equipos (Python, Go, Java…).
+:::
+
+# REST vs gRPC
+
+| Aspecto | REST (envases / cubetas) | gRPC (cañería) |
+|---------|--------------------------|----------------|
+| Transporte | Peticiones discretas | Stream continuo |
+| Orquestación | Quien reparte (a menudo el cliente) | Tubería entre estaciones backend |
+| Progreso | Tras cada envase entregado | Nivel sube en tiempo real |
+| Contrato | Documentación | Plano `.proto` |
+| Uso típico | Hacia fuera (browser, terceros) | Entre estaciones internas |
+
+::: {.depth-hint .fragment}
+Profundización opcional ↓ — envases vs conducto
+:::
+
+## Envases vs cañería
+
+::: {.mermaid-compact}
+```{mermaid}
+flowchart LR
+  subgraph rest [REST_envases]
+    Cliente[Cliente] -->|"envase"| EstA[Estacion_A]
+    EstA -->|"envase"| EstB[Estacion_B]
+  end
+  subgraph grpc [gRPC_cañeria]
+    EstC[Estacion_C] -->|"stream"| EstD[Estacion_D]
+  end
+```
+:::
+
+::: {.small}
+El browser **no es la cañería**; es el **medidor** (SSE). La tubería corre detrás, en el backend.
+:::
+
+# Beneficios de gRPC
+
+::: {.incremental}
+- **Plano versionable** — `.proto` alinea estaciones y equipos
+- **Menos fricción** — conducto más eficiente entre servicios internos
+- **Caudal continuo** — no esperar a llenar cubetas enteras
+- **Mismas tuberías, equipos distintos** — multi-lenguaje con un plano
+- **Menos derrames** — tipos definidos; menos errores de integración
+:::
+
+# ¿Cuándo usar gRPC?
+
+::: {.two-col-list}
+- **Sí:** flujos grandes, muchas estaciones, caudal continuo, backend ↔ backend
+- **No:** envases individuales para terceros (API pública, curl, CRUD simple)
+:::
+
+::: {.callout-important .callout-compact}
+**Envases hacia fuera · cañería hacia dentro**
+:::
+
+::: {.depth-hint .fragment}
+Profundización opcional ↓ — medidor vs tubería
+:::
+
+::: {.notes}
+Si preguntan por browser → rama gateway. REST también puede hacer streaming; aquí comparamos el patrón típico de la demo.
+:::
+
+## Medidor vs tubería
+
+- El usuario ve el **nivel** en el panel (SSE), no la tubería gRPC directamente
+- El **gateway** traduce cañería interna → lectura humana
+
+::: {.mermaid-compact}
+```{mermaid}
+flowchart LR
+  Panel[Panel] -->|"REST SSE"| GW[Gateway]
+  GW -->|"gRPC"| ING[Ingest]
+  ING -->|"gRPC"| TRF[Transform]
+  TRF -->|"gRPC"| GW
+```
+:::
+
+::: {.small}
+FastAPI + gRPC en el mismo proyecto — medidor y planta, dos puertos.
+:::
+
+# Demo: la historia
+
+**Misma agua:** ~50 000 transacciones CSV. **Distinto transporte:** cubetas/envases vs cañería.
+
+| Rol | Metáfora | Componente |
+|-----|----------|------------|
+| Panel de control | Ve el nivel subir | Frontend |
+| Medidor | Cañería → lectura humana | Gateway |
+| Captación | Toma agua del depósito | Ingest |
+| Tratamiento | Transforma el flujo | Transform |
+| Depósito | Fuente del líquido | `transactions.csv` |
+
+# Demo: arquitectura
+
+**Planta en modo cañería** — el flujo pasa por captación y tratamiento; el panel ve el nivel.
+
+::: {.mermaid-compact}
+```{mermaid}
+flowchart LR
+  User[Usuario] --> Panel[Panel]
+  Panel -->|"abrir grifo"| GW[Gateway]
+  Panel -->|"SSE nivel"| GW
+  GW --> ING[Captacion]
+  ING --> TRF[Tratamiento]
+  ING --> CSV[(Deposito)]
+  TRF --> GW
+```
+:::
+
+::: {.small}
+Captación y Tratamiento son **internos**; Panel y Gateway son la interfaz visible.
+:::
+
+::: {.depth-hint}
+Profundización opcional ↓ — secuencia de la tubería y comparativa con envases
+:::
+
+::: {.notes}
+Demo en vivo con modo lento. Misma agua, dos modos: cañería (gRPC) vs envases (REST).
+:::
+
+## Al abrir el grifo
+
+`POST /jobs` abre el caudal; SSE muestra el **nivel** en el panel — sin llenar la cubeta entera.
+
+::: {.mermaid-compact}
+```{mermaid}
+sequenceDiagram
+  participant Panel as Panel
+  participant GW as Gateway
+  participant ING as Captacion
+  participant TRF as Tratamiento
+
+  Panel->>GW: POST /jobs
+  GW->>ING: StartPipeline
+  Panel->>GW: SSE nivel
+  loop Caudal continuo
+    ING->>TRF: RawRecord
+    TRF->>GW: ProgressEvent
+    GW-->>Panel: SSE
+  end
+```
+:::
+
+## Tipos de llamada en la planta
+
+::: {.columns}
+::: {.column width="50%"}
+**Unary** — ¿abrir válvula?
+
+`StartPipeline`
+
+*«¿Iniciar caudal?» → «Sí, job_id=abc»*
+:::
+
+::: {.column width="50%"}
+**Client streaming** — registro a registro
+
+`TransformStream`
+
+*Caudal continuo → resumen al cerrar*
+:::
+:::
+
+::: {.small}
+**Sensor de nivel:** `PublishEvents` — aviso cada N registros procesados.
+:::
+
+## Un plano para todas las estaciones
+
+Un solo `.proto` — plano de planta compartido:
+
+```protobuf
+service IngestService {
+  rpc StartPipeline(...) returns (...);
+}
+service TransformService {
+  rpc TransformStream(stream RawRecord) returns (...);
+}
+service ProgressService {
+  rpc PublishEvents(stream ProgressEvent) returns (...);
+}
+```
+
+::: {.small}
+Archivo: `proto/pipeline/v1/pipeline.proto`
+:::
+
+## Misma agua: envases vs cañería
+
+En la UI, la pestaña REST reparte **envases** desde el browser; gRPC usa **cañería** en backend.
+
+::: {.mermaid-compact}
+```{mermaid}
+flowchart LR
+  Panel[Panel] -->|"envases GET"| RI[rest-ingest]
+  Panel -->|"envases POST"| RT[rest-transform]
+  RI --> CSV[(Deposito)]
+```
+:::
+
+| Aspecto | Cañería (gRPC) | Envases (REST) |
+|---------|----------------|----------------|
+| Peticiones panel | ~2 | 1 + 2 × lotes |
+| Orquestación | Planta (backend) | Panel (browser) |
+| Progreso | Nivel en tiempo real | Tras cada envase |
+
+# Demo en vivo
+
+::: {.incremental}
+1. Levantar la planta: `docker compose up --build`
+2. Abrir el panel: **http://localhost:5173**
+3. **Modo lento** → abrir grifo (pestaña gRPC) — observa el nivel
+4. Pestaña REST → el browser **reparte envases**
+5. Tabla comparativa — mismo líquido, distinto transporte
+:::
+
+::: {.callout-tip .callout-compact}
+Cañería: menos idas y vueltas y nivel continuo. Envases: más peticiones visibles en el panel.
+:::
+
+# Takeaways
+
+::: {.incremental}
+1. No todo debe ser cañería — a veces convienen **envases** (REST)
+2. El **plano `.proto`** alinea estaciones y equipos
+3. El **streaming** evita llenar cubetas enteras en memoria
+4. **Envases afuera, cañería adentro** — patrón de planta moderna
+:::
+
+::: {.depth-hint .fragment}
+Profundización opcional ↓ — glosario y recursos
+:::
+
+::: {.notes}
+Recuerda los límites de la metáfora: gRPC también envía mensajes discretos; la cañería es continuidad lógica del flujo.
+:::
+
+## Glosario express
+
+| Término | Significado |
+|---------|-------------|
+| **RPC** | Una estación invoca trabajo en otra por la red |
+| **gRPC** | Cañería moderna con plano `.proto` y HTTP/2 |
+| **Streaming** | Flujo continuo por la tubería |
+| **Pipeline** | Cadena de estaciones en serie |
+| **Gateway** | Medidor entre planta y panel |
+| **SSE** | Lectura del nivel en el panel |
+| **`.proto`** | Plano de la planta (estaciones y conexiones) |
+
+## Recursos
+
+| Recurso | Ubicación |
+|---------|-----------|
+| Guía didáctica | `docs/GUIA_DIDACTICA.md` |
+| Doc técnica | `docs/DESCRIPCION_TECNICA.md` |
+| Arranque rápido | `README.md` |
+| Panel demo | http://localhost:5173 |
+
+# ¿Preguntas?
+
+**César Cárdenas**
+
+Demo: `rpc_demo` · Planta de procesamiento: cubetas, envases y cañería
+
+::: {.notes}
+Invita a clonar el repo y comparar ambas pestañas como “misma agua, dos modos de transporte”.
+:::

@@ -1,0 +1,178 @@
+/*-- scss:defaults --*/
+
+$presentation-heading-color: #5eead4 !default;
+$link-color: #38bdf8 !default;
+$body-bg: #0f172a !default;
+$body-color: #e2e8f0 !default;
+$code-color: #7dd3fc !default;
+
+/*-- scss:rules --*/
+
+.reveal {
+  font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+}
+
+.reveal h1,
+.reveal h2,
+.reveal h3 {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.reveal h1 {
+  font-size: 1.85em;
+}
+
+.reveal h2 {
+  font-size: 1.45em;
+  border-bottom: 2px solid rgba(94, 234, 212, 0.35);
+  padding-bottom: 0.25em;
+  margin-bottom: 0.5em;
+}
+
+.reveal .subtitle {
+  color: #94a3b8;
+  font-size: 0.95em;
+  margin-top: 0.5em;
+}
+
+.reveal .author {
+  color: #5eead4;
+  font-size: 1.1em;
+  margin-top: 1.5em;
+}
+
+.reveal table {
+  font-size: 0.72em;
+  margin: 0 auto;
+}
+
+.reveal table.compact-table {
+  font-size: 0.65em;
+  table-layout: fixed;
+  width: 100%;
+}
+
+.reveal table.compact-table td:first-child,
+.reveal table.compact-table th:first-child {
+  width: 28%;
+}
+
+.reveal table th {
+  background: rgba(56, 189, 248, 0.15);
+  color: #5eead4;
+}
+
+.reveal table td,
+.reveal table th {
+  border-color: rgba(148, 163, 184, 0.25);
+  padding: 0.4em 0.65em;
+}
+
+.reveal .callout {
+  font-size: 0.78em;
+  margin: 0.4em 0;
+}
+
+.reveal .callout-compact {
+  font-size: 0.7em;
+  margin: 0.25em 0;
+  padding: 0.35em 0.55em;
+}
+
+.reveal .callout-tip {
+  border-left-color: #5eead4;
+  background: rgba(94, 234, 212, 0.08);
+}
+
+.reveal .callout-warning {
+  border-left-color: #fbbf24;
+  background: rgba(251, 191, 36, 0.08);
+}
+
+.reveal .callout-important {
+  border-left-color: #38bdf8;
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.reveal .mermaid {
+  font-size: 0.55em;
+}
+
+.reveal section.title-slide:not(.quarto-title-block) {
+  text-align: left;
+}
+
+.reveal section.title-slide:not(.quarto-title-block) h1 {
+  font-size: 1.5em;
+  margin-bottom: 0.4em;
+}
+
+.reveal .mermaid svg {
+  max-height: 340px;
+}
+
+.reveal .mermaid-compact svg {
+  max-height: 300px;
+}
+
+.reveal .mermaid-wide svg {
+  max-height: 360px;
+  max-width: 100%;
+}
+
+.reveal ul {
+  font-size: 0.82em;
+}
+
+.reveal li {
+  margin-bottom: 0.3em;
+}
+
+.reveal .footer {
+  font-size: 0.42em;
+  color: #64748b;
+}
+
+.reveal .slide-number {
+  font-size: 0.48em;
+  color: #64748b;
+}
+
+.reveal section .columns {
+  display: flex;
+  gap: 1.2em;
+  align-items: flex-start;
+}
+
+.reveal section .column {
+  flex: 1;
+}
+
+.reveal .small {
+  font-size: 0.72em;
+  color: #94a3b8;
+}
+
+.reveal .depth-hint {
+  font-size: 0.65em;
+  color: #5eead4;
+  margin-top: 0.6em;
+  opacity: 0.9;
+}
+
+.reveal pre code {
+  font-size: 0.52em;
+  max-height: 280px;
+}
+
+.reveal section.allow-scroll {
+  overflow-y: auto !important;
+  max-height: 680px;
+}
+
+.reveal .two-col-list {
+  columns: 2;
+  column-gap: 1.5em;
+  font-size: 0.78em;
+}

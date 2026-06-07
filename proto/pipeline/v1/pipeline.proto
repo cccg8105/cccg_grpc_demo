@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package pipeline.v1;
+
+option py_generic_services = false;
+
+service IngestService {
+  rpc StartPipeline(StartPipelineRequest) returns (StartPipelineResponse);
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+service TransformService {
+  rpc TransformStream(stream RawRecord) returns (TransformSummary);
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+service ProgressService {
+  rpc PublishEvents(stream ProgressEvent) returns (Ack);
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message StartPipelineRequest {
+  string job_id = 1;
+  string file_path = 2;
+  int32 chunk_size = 3;
+  int32 sleep_ms = 4;
+}
+
+message StartPipelineResponse {
+  string job_id = 1;
+  string status = 2;
+}
+
+message RawRecord {
+  string job_id = 1;
+  int32 line_number = 2;
+  string payload_json = 3;
+  int64 bytes_read = 4;
+  int32 total_rows_estimate = 5;
+  int64 total_file_bytes = 6;
+}
+
+message ProgressEvent {
+  string job_id = 1;
+  string stage = 2;
+  int64 timestamp_ms = 3;
+  string record_preview = 4;
+  int32 rows_processed = 5;
+  int32 rows_rejected = 6;
+  double total_usd = 7;
+  int32 total_rows_estimate = 8;
+  double throughput_rows_per_sec = 9;
+  bool job_complete = 10;
+  string message = 11;
+  int64 bytes_streamed = 12;
+  int64 total_file_bytes = 13;
+  double throughput_bytes_per_sec = 14;
+}
+
+message TransformSummary {
+  int32 rows_processed = 1;
+  int32 rows_rejected = 2;
+  double total_usd = 3;
+}
+
+message Ack {
+  bool ok = 1;
+}
+
+message PingRequest {}
+
+message PingResponse {
+  string status = 1;
+}
