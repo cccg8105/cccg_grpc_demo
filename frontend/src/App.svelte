@@ -1,8 +1,8 @@
 <script lang="ts">
-  import ComparisonPanel from './components/ComparisonPanel.svelte.svelte';
-  import GrpcTab from './components/tabs/GrpcTab.svelte.svelte';
-  import RestTab from './components/tabs/RestTab.svelte.svelte';
-  import { upsertRunHistory, type RunMetrics } from './components/runMetricsMetrics';
+  import ComparisonPanel from './components/ComparisonPanel.svelte';
+  import GrpcTab from './components/tabs/GrpcTab.svelte';
+  import RestTab from './components/tabs/RestTab.svelte';
+  import { upsertRunHistory, type RunMetrics } from './components/runMetrics';
 
   let activeTab = $state<'grpc' | 'rest'>('grpc');
   let chunkSize = $state(100);
