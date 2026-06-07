@@ -1,4 +1,11 @@
-"""Transform gRPC service: enriches records and reports progress to gateway."""
+"""Transform gRPC service: recibe un stream de RawRecord, aplica transformación y reporta progreso.
+
+Flujo:
+1. Ingest envía filas CSV serializadas vía client-streaming RPC `TransformStream`.
+2. Transform aplica `transform_record` a cada fila: convierte moneda, categoriza merchant, marca high_value.
+3. Cada N filas (PROGRESS_EVERY) emite un ProgressEvent hacia el gateway vía `PublishEvents`.
+4. Al cerrar el stream, devuelve TransformSummary con totales procesados/rechazados.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 GATEWAY_TARGET = os.getenv("GATEWAY_TARGET", "gateway:50053")
 TRANSFORM_PORT = int(os.getenv("TRANSFORM_PORT", "50052"))
-PROGRESS_EVERY = int(os.getenv("PROGRESS_EVERY", "50"))
+PROGRESS_EVERY = int(os.getenv("PROGRESS_EVERY", "10000"))
 
 
 def _format_bytes(value: int) -> str:
@@ -33,10 +40,13 @@ def _format_bytes(value: int) -> str:
 
 
 class TransformServicer(pipeline_pb2_grpc.TransformServiceServicer):
+    """Implementación del servicio Transform: recibe RawRecord, transforma, emite progreso."""
+
     def Ping(self, request, context):
         return pipeline_pb2.PingResponse(status="ok")
 
     def TransformStream(self, request_iterator, context):
+        # Contadores de procesamiento
         rows_processed = 0
         rows_rejected = 0
         total_usd = 0.0
@@ -48,7 +58,78 @@ class TransformServicer(pipeline_pb2_grpc.TransformServiceServicer):
         last_preview = ""
         seen_first = False
 
+        # Iterar sobre el stream de RawRecord enviado por Ingest (client-streaming RPC)
         for raw in request_iterator:
+            job_id = raw.job_id or job_id
+            total_estimate = raw.total_rows_estimate or total_estimate
+            total_file_bytes = raw.total_file_bytes or total_file_bytes
+            bytes_streamed = raw.bytes_read
+            payload = json.loads(raw.payload_json)
+            transformed, error = transform_record(payload)
+            elapsed = max(time.monotonic() - start_time, 0.001)
+            bytes_throughput = bytes_streamed / elapsed
+
+            # Primer evento: notificar que Ingest ya empezó a emitir filas
+            if not seen_first:
+                seen_first = True
+                self._emit_progress(
+                    self._build_progress_event(
+                        job_id=job_id,
+                        stage="ingest",
+                        record_preview=raw.payload_json[:120],
+                        rows_processed=0,
+                        rows_rejected=0,
+                        total_usd=0.0,
+                        total_estimate=total_estimate,
+                        throughput_rows=0.0,
+                        bytes_streamed=bytes_streamed,
+                        total_file_bytes=total_file_bytes,
+                        bytes_throughput=bytes_throughput,
+                        job_complete=False,
+                        message=(
+                            f"Ingest streaming from line {raw.line_number} "
+                            f"({_format_bytes(bytes_streamed)} streamed)"
+                        ),
+                    )
+                )
+
+            if error:
+                rows_rejected += 1
+            else:
+                rows_processed += 1
+                total_usd += transformed["amount_usd"]
+                last_preview = preview_record(transformed)
+
+            total_handled = rows_processed + rows_rejected
+            elapsed = max(time.monotonic() - start_time, 0.001)
+            throughput = rows_processed / elapsed
+            bytes_throughput = bytes_streamed / elapsed
+
+            # Eventos periódicos de progreso cada PROGRESS_EVERY filas
+            if total_handled % PROGRESS_EVERY == 0:
+                self._emit_progress(
+                    self._build_progress_event(
+                        job_id=job_id,
+                        stage="transform",
+                        record_preview=last_preview,
+                        rows_processed=rows_processed,
+                        rows_rejected=rows_rejected,
+                        total_usd=round(total_usd, 2),
+                        total_estimate=total_estimate,
+                        throughput_rows=round(throughput, 2),
+                        bytes_streamed=bytes_streamed,
+                        total_file_bytes=total_file_bytes,
+                        bytes_throughput=bytes_throughput,
+                        job_complete=False,
+                        message=(
+                            f"Processed line {raw.line_number} "
+                            f"({_format_bytes(bytes_streamed)} streamed)"
+                        ),
+                    )
+                )
+
+        # Evento final: pipeline completado
+        if job_id:
             job_id = raw.job_id or job_id
             total_estimate = raw.total_rows_estimate or total_estimate
             total_file_bytes = raw.total_file_bytes or total_file_bytes

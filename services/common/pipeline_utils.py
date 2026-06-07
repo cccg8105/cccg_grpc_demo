@@ -9,6 +9,7 @@ from typing import Any
 
 
 EXCHANGE_RATES = {
+    # Tasas de cambio fijas para la demo (1 unidad de moneda -> USD)
     "USD": 1.0,
     "EUR": 1.08,
     "GBP": 1.27,
@@ -16,6 +17,7 @@ EXCHANGE_RATES = {
 }
 
 MERCHANT_CATEGORIES = {
+    # Mapeo de comercios a categorías de gasto
     "Amazon": "retail",
     "Starbucks": "food",
     "Shell": "fuel",
@@ -28,6 +30,7 @@ MERCHANT_CATEGORIES = {
     "McDonald's": "food",
 }
 
+# Umbral para marcar una transacción como de alto valor (en USD)
 HIGH_VALUE_THRESHOLD = float(os.getenv("HIGH_VALUE_THRESHOLD", "1000"))
 
 

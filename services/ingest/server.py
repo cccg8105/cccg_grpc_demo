@@ -1,4 +1,11 @@
-"""Ingest gRPC service: reads CSV and streams raw records to transform."""
+"""Ingest gRPC service: lee el CSV fila por fila y emite un stream de RawRecord hacia Transform.
+
+Flujo:
+1. El gateway llama a `StartPipeline` (unary RPC).
+2. Ingest arranca un hilo que abre el CSV y hace client-streaming hacia Transform.
+3. Cada X filas (chunk_size) puede introducir un sleep artificial (sleep_ms)
+   para ralentizar la demo y que el streaming sea visible en la UI.
+"""
 
 from __future__ import annotations
 
@@ -58,10 +65,27 @@ class IngestServicer(pipeline_pb2_grpc.IngestServiceServicer):
         chunk_size: int,
         sleep_ms: int,
     ) -> None:
+        """Hilo worker que ejecuta el pipeline: CSV -> TransformStream gRPC.
+
+        Abre un canal gRPC hacia transform-service y envía todas las filas del CSV
+        como mensajes RawRecord. Al finalizar, recibe un TransformSummary.
+        """
         channel = grpc.insecure_channel(TRANSFORM_TARGET)
         stub = pipeline_pb2_grpc.TransformServiceStub(channel)
 
         def record_generator():
+            """Generador que produce RawRecord protobuf por cada fila del CSV.
+
+            Implementación row-by-row con csv.DictReader + generador Python:
+            - Memoria O(1) por fila, sin DataFrame completo en RAM.
+            - Cada fila se serializa a JSON (payload_json) para enviarla por gRPC.
+            - bytes_read acumula el tamaño JSON enviado (métrica de stream).
+            - Respeta chunk_size: tras procesar N filas puede dormir sleep_ms
+              para ralentizar la demo (modo lento visible en UI).
+
+            Nota: no se usa Polars ni pandas porque el looping natural de csv.DictReader
+            ya es eficiente para este flujo continuo y evita dependencias pesadas.
+            """
             meta = file_meta(file_path)
             total_estimate = meta["total_rows"]
             total_file_bytes = meta["total_file_bytes"]

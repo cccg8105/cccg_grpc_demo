@@ -134,7 +134,7 @@ sequenceDiagram
 
 ### Paso a paso (referencias de código)
 
-1. **Frontend** — [`GrpcTab.svelte`](../frontend/src/lib/tabs/GrpcTab.svelte) llama `startJob()` en [`api.ts`](../frontend/src/lib/api.ts) con `chunk_size` y `sleep_ms` (modo lento → 80 ms).
+1. **Frontend** — [`GrpcTab.svelte`](../frontend/src/components/tabs/GrpcTab.svelte) llama `startJob()` en [`api.ts`](../frontend/src/components/api.ts) con `chunk_size` y `sleep_ms` (modo lento → 80 ms).
 2. **Gateway** — [`main.py`](../services/gateway/main.py):
    - `POST /jobs` → crea `job_id` en `JobHub`, lanza thread que invoca `IngestService.StartPipeline`.
    - `GET /jobs/{id}/events` → SSE desde cola asyncio por suscriptor.
@@ -190,8 +190,8 @@ sequenceDiagram
 
 ### Implementación
 
-- **Cliente loop:** [`restBatchClient.ts`](../frontend/src/lib/restBatchClient.ts) — `runRestBatchPipeline()`.
-- **UI:** [`RestTab.svelte`](../frontend/src/lib/tabs/RestTab.svelte).
+- **Cliente loop:** [`restBatchClient.ts`](../frontend/src/components/restBatchClient.ts) — `runRestBatchPipeline()`.
+- **UI:** [`RestTab.svelte`](../frontend/src/components/tabs/RestTab.svelte).
 
 ### Endpoints
 
@@ -219,7 +219,7 @@ frontend/src/
 ├── App.svelte                 # Pestañas, chunkSize, slowMode, runHistory
 ├── main.js
 ├── app.css
-└── lib/
+└── components/
     ├── api.ts                 # Gateway: POST /jobs, EventSource SSE
     ├── restBatchClient.ts     # Loop REST + acumulación métricas
     ├── runMetrics.ts          # Tipo RunMetrics, helpers comparativa
@@ -367,7 +367,7 @@ Un cambio en reglas de negocio en `pipeline_utils.py` afecta **ambos modos** aut
 | `file_meta(path)` | `{ total_rows, total_file_bytes }` |
 | `read_batch(path, offset, limit)` | Paginación offset/limit para REST |
 
-**Ingest gRPC** no usa `read_batch`; itera el CSV completo en un generador. Si cambias el formato del CSV, revisa ambos caminos.
+**Ingest gRPC** no usa `read_batch`; itera el CSV completo en un generador row-by-row (`csv.DictReader`) sin cargar el archivo en memoria como DataFrame. Si cambias el formato del CSV, revisa ambos caminos (`csv_batch.py` y el generador en `ingest/server.py`).
 
 ### Dataset
 
@@ -385,7 +385,7 @@ Columnas: `id, amount, currency, merchant, timestamp`.
 
 ### Tipo `RunMetrics`
 
-Definido en [`runMetrics.ts`](../frontend/src/lib/runMetrics.ts):
+Definido en [`runMetrics.ts`](../frontend/src/components/runMetrics.ts):
 
 ```typescript
 type RunMetrics = {
@@ -414,7 +414,7 @@ type RunMetrics = {
 | `timeToFirstUpdateMs` | Primer evento SSE (excl. `connected`) | Tras primer lote GET+POST |
 | `wallClockMs` | `performance.now()` inicio → `job_complete` | Inicio loop → fin loop |
 
-Al completar un modo, `App.svelte` guarda la última ejecución por modo en `runHistory` (máx. 2 entradas). [`ComparisonPanel.svelte`](../frontend/src/lib/ComparisonPanel.svelte) muestra diff REST vs gRPC cuando existen ambas.
+Al completar un modo, `App.svelte` guarda la última ejecución por modo en `runHistory` (máx. 2 entradas). [`ComparisonPanel.svelte`](../frontend/src/components/ComparisonPanel.svelte) muestra diff REST vs gRPC cuando existen ambas.
 
 ### Bytes: no confundir métricas
 
@@ -531,8 +531,8 @@ cd frontend && npm run build
 2. Ejecutar `scripts/generate_proto.py`.
 3. Poblar el campo en `TransformServicer._build_progress_event()` ([`transform/server.py`](../services/transform/server.py)).
 4. Serializar en `_event_to_dict()` ([`gateway/main.py`](../services/gateway/main.py)).
-5. Extender tipo `ProgressEvent` en [`api.ts`](../frontend/src/lib/api.ts).
-6. Mostrar en [`GrpcTab.svelte`](../frontend/src/lib/tabs/GrpcTab.svelte) si aplica.
+5. Extender tipo `ProgressEvent` en [`api.ts`](../frontend/src/components/api.ts).
+6. Mostrar en [`GrpcTab.svelte`](../frontend/src/components/tabs/GrpcTab.svelte) si aplica.
 7. `make smoke` + rebuild Docker.
 
 ### Checklist pre-PR

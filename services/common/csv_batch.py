@@ -1,4 +1,12 @@
-"""Shared CSV batch reading for gRPC ingest and REST APIs."""
+"""Shared CSV helpers for gRPC ingest and REST APIs.
+
+Nota sobre diseño:
+- `count_rows` y `file_meta` escanean el archivo una sola vez para obtener metadata.
+- `read_batch` lee fila por fila desde el inicio hasta `offset + limit`.
+  Para el demo (~50k filas) el overhead de escanear desde el offset es aceptable.
+  En datasets muy grandes, una alternativa futura podría ser indexar el CSV o usar
+  formatos binarios tipo Parquet / `read_csv_batched` de Polars.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +28,13 @@ def file_meta(file_path: str) -> dict[str, int]:
 
 
 def read_batch(file_path: str, offset: int, limit: int) -> list[dict[str, str]]:
-    """Return up to `limit` data rows starting at zero-based `offset`."""
+    """Devuelve hasta `limit` filas de datos desde `offset` (base cero).
+
+    Implementación secuencial con csv.DictReader:
+    - Escanea el CSV desde el inicio saltando `offset` filas.
+    - No usa slicing en memoria ni DataFrame; O(limit) filas retenidas.
+    - Completa metadata via `file_meta` en el endpoint REST para evitar recomputos.
+    """
     if limit <= 0:
         return []
 

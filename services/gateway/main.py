@@ -1,4 +1,10 @@
-"""Gateway: REST + SSE for frontend, gRPC ProgressService for transform."""
+"""Gateway: REST + SSE para el frontend, y servidor gRPC ProgressService para recibir eventos de progreso.
+
+El gateway actúa como puente entre el navegador (HTTP/SSE) y los servicios backend (gRPC):
+- Expone endpoints REST para iniciar jobs y consultar estado.
+- Expone un endpoint SSE para enviar eventos de progreso en tiempo real al frontend.
+- Implementa un servidor gRPC `ProgressService` que recibe eventos de progreso desde el servicio Transform.
+"""
 
 from __future__ import annotations
 
@@ -36,15 +42,21 @@ DEFAULT_FILE = os.getenv("DEFAULT_FILE", "/data/transactions.csv")
 
 @dataclass
 class JobState:
-    job_id: str
-    status: str = "pending"
+    """Estado interno de un job de pipeline."""
+    job_id: str  # Identificador único del job
+    status: str = "pending"  # Estado actual: pending | starting | running | complete
+    # Colas de SSE para cada subscriptor del frontend
     subscribers: list[asyncio.Queue] = field(default_factory=list)
+    # Último evento recibido (para suscriptores que se conecten tarde)
     last_event: dict | None = None
 
 
 class JobHub:
+    """Registro en memoria de jobs y sus subscriptores SSE."""
     def __init__(self) -> None:
+        # Diccionario: job_id -> JobState
         self._jobs: dict[str, JobState] = {}
+        # Lock para acceso concurrente desde FastAPI y gRPC
         self._lock = asyncio.Lock()
 
     async def create_job(self) -> JobState:
@@ -69,6 +81,11 @@ class JobHub:
         return queue
 
     async def publish(self, event: pipeline_pb2.ProgressEvent) -> None:
+        """Publica un evento de progreso en el job correspondiente.
+
+        Convierte el evento protobuf a diccionario JSON y lo envía a todos
+        los subscriptores SSE del job. Actualiza el último evento cacheado.
+        """
         payload = _event_to_dict(event)
         job = await self.get_job(event.job_id)
         if job is None:
@@ -81,11 +98,13 @@ class JobHub:
         else:
             job.status = "running"
 
+        # Enviar evento a cada cola de subscriptores (no bloquea si la cola está llena)
         for queue in list(job.subscribers):
             await queue.put(payload)
 
 
 def _event_to_dict(event: pipeline_pb2.ProgressEvent) -> dict:
+    """Traduce un ProgressEvent protobuf a un diccionario JSON listo para SSE."""
     return {
         "job_id": event.job_id,
         "stage": event.stage,
@@ -98,8 +117,11 @@ def _event_to_dict(event: pipeline_pb2.ProgressEvent) -> dict:
         "throughput_rows_per_sec": event.throughput_rows_per_sec,
         "job_complete": event.job_complete,
         "message": event.message,
+        # Bytes JSON acumulados enviados Ingest -> Transform vía gRPC
         "bytes_streamed": event.bytes_streamed,
+        # Tamaño del CSV en disco (desde file_meta)
         "total_file_bytes": event.total_file_bytes,
+        # Throughput de bytes del stream gRPC (bytes_streamed / elapsed)
         "throughput_bytes_per_sec": event.throughput_bytes_per_sec,
     }
 
@@ -109,13 +131,23 @@ loop_holder: dict[str, asyncio.AbstractEventLoop] = {}
 
 
 class ProgressServicer(pipeline_pb2_grpc.ProgressServiceServicer):
+    """Implementación del servicio gRPC que recibe eventos de progreso desde Transform.
+
+    Transform envía eventos vía client-streaming RPC (`PublishEvents`).
+    Este servicer traduce cada evento y lo publica en el JobHub correspondiente,
+    notificando a los subscriptores SSE del frontend.
+    """
+
     def Ping(self, request, context):
         return pipeline_pb2.PingResponse(status="ok")
 
     def PublishEvents(self, request_iterator, context):
+        # Obtener el event loop principal (donde corre FastAPI) para despachar tareas asíncronas
+        # desde este hilo síncrono de gRPC.
         event_loop = loop_holder.get("loop")
         for event in request_iterator:
             if event_loop is not None:
+                # Publicar evento en el JobHub de forma thread-safe
                 future = asyncio.run_coroutine_threadsafe(
                     hub.publish(event),
                     event_loop,
@@ -143,17 +175,24 @@ def start_grpc_server() -> grpc.Server:
 
 
 class CreateJobRequest(BaseModel):
-    file_path: str = Field(default=DEFAULT_FILE)
-    chunk_size: int = Field(default=100, ge=1, le=10000)
-    sleep_ms: int = Field(default=0, ge=0, le=5000)
+    """Parámetros para iniciar un pipeline gRPC desde el frontend."""
+    file_path: str = Field(default=DEFAULT_FILE)  # Ruta del CSV en el contenedor
+    chunk_size: int = Field(default=100, ge=1, le=10000)  # Filas por chunk (afecta sleeps en ingest)
+    sleep_ms: int = Field(default=0, ge=0, le=5000)  # Retardo artificial por chunk para demo (modo lento)
 
 
 class CreateJobResponse(BaseModel):
-    job_id: str
-    status: str
+    """Respuesta inmediata al crear un job."""
+    job_id: str  # Identificador para suscribirse a eventos SSE
+    status: str  # Estado inicial (normalmente "starting")
 
 
 def _start_pipeline(job_id: str, file_path: str, chunk_size: int, sleep_ms: int) -> None:
+    """Dispara el pipeline gRPC llamando a IngestService.StartPipeline.
+
+    Se ejecuta en un hilo demonio para no bloquear la respuesta HTTP POST /jobs.
+    El gateway actúa como cliente gRPC hacia ingest-service.
+    """
     channel = grpc.insecure_channel(INGEST_TARGET)
     stub = pipeline_pb2_grpc.IngestServiceStub(channel)
     try:
