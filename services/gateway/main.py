@@ -144,7 +144,7 @@ def start_grpc_server() -> grpc.Server:
 
 class CreateJobRequest(BaseModel):
     file_path: str = Field(default=DEFAULT_FILE)
-    chunk_size: int = Field(default=100, ge=1, le=5000)
+    chunk_size: int = Field(default=100, ge=1, le=10000)
     sleep_ms: int = Field(default=0, ge=0, le=5000)
 
 

@@ -55,7 +55,7 @@ async def get_meta(file_path: str | None = Query(default=None)):
 @app.get("/records")
 async def get_records(
     offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=100, ge=1, le=5000),
+    limit: int = Query(default=100, ge=1, le=10000),
     file_path: str | None = Query(default=None),
 ):
     path = _resolve_file(file_path)
