@@ -110,7 +110,7 @@ flowchart TB
   Proto --> Gen[Generador]
   Gen --> SvcA[Ingest]
   Gen --> SvcB[Transform]
-  Gen --> SvcC[Gateway]
+  Gen --> SvcC[Gateway cliente]
 ```
 :::
 
@@ -122,9 +122,10 @@ Mismo plano, distintos equipos (Python, Go, Java…).
 
 | Aspecto | REST (envases / cubetas) | gRPC (cañería) |
 |---------|--------------------------|----------------|
-| Transporte | Peticiones discretas | Stream continuo |
-| Orquestación | Quien reparte (a menudo el cliente) | Tubería entre estaciones backend |
-| Progreso | Tras cada envase entregado | Nivel sube en tiempo real |
+| Transporte interno | HTTP JSON por lote | Streams gRPC (protobuf) |
+| Panel (browser) | POST /jobs + SSE | POST /jobs + SSE |
+| Orquestación | Captación coordina el flujo (backend) | Captación coordina el flujo (backend) |
+| Progreso | Un aviso por lote completado (SSE) | Un aviso por lote completado (SSE) |
 | Contrato | Documentación | Plano `.proto` |
 | Uso típico | Hacia fuera (browser, terceros) | Entre estaciones internas |
 
@@ -148,7 +149,7 @@ flowchart LR
 :::
 
 ::: {.small}
-El browser **no es la cañería**; es el **medidor** (SSE). La tubería corre detrás, en el backend.
+En la demo, **ambos modos** usan el mismo panel (POST + SSE). La diferencia está en el conducto **entre** Captación y Tratamiento.
 :::
 
 # Beneficios de gRPC
@@ -189,14 +190,13 @@ Si preguntan por browser → rama gateway. REST también puede hacer streaming; 
 ```{mermaid}
 flowchart LR
   Panel[Panel] -->|"REST SSE"| GW[Gateway]
-  GW -->|"gRPC"| ING[Ingest]
-  ING -->|"gRPC"| TRF[Transform]
-  TRF -->|"gRPC"| GW
+  GW -->|"RunPipeline stream"| ING[Captacion]
+  ING <-->|"TransformStream bidi"| TRF[Tratamiento]
 ```
 :::
 
 ::: {.small}
-FastAPI + gRPC en el mismo proyecto — medidor y planta, dos puertos.
+FastAPI en el gateway — **cliente** gRPC de `RunPipeline`; la cañería de progreso sale de Captación, no de Tratamiento.
 :::
 
 # Demo: la historia
@@ -206,30 +206,30 @@ FastAPI + gRPC en el mismo proyecto — medidor y planta, dos puertos.
 | Rol | Metáfora | Componente |
 |-----|----------|------------|
 | Panel de control | Ve el nivel subir | Frontend |
-| Medidor | Cañería → lectura humana | Gateway |
-| Captación | Toma agua del depósito | Ingest |
-| Tratamiento | Transforma el flujo | Transform |
+| Medidor | Traduce cañería → lectura humana (SSE) | Gateway |
+| **Orquestador** | Coordina captación + tratamiento + avisos | Ingest |
+| Tratamiento | Worker: transforma cada lote | Transform |
 | Depósito | Fuente del líquido | `transactions.csv` |
 
 # Demo: arquitectura
 
-**Planta en modo cañería** — el flujo pasa por captación y tratamiento; el panel ve el nivel.
+**Planta en modo cañería** — Captación orquesta; el medidor solo consume el stream de progreso.
 
 ::: {.mermaid-compact}
 ```{mermaid}
 flowchart LR
   User[Usuario] --> Panel[Panel]
-  Panel -->|"abrir grifo"| GW[Gateway]
+  Panel -->|"POST /jobs"| GW[Gateway]
   Panel -->|"SSE nivel"| GW
-  GW --> ING[Captacion]
-  ING --> TRF[Tratamiento]
+  GW -->|"RunPipeline"| ING[Captacion]
+  ING <-->|"bidi"| TRF[Tratamiento]
   ING --> CSV[(Deposito)]
-  TRF --> GW
+  ING -->|"ProgressEvent"| GW
 ```
 :::
 
 ::: {.small}
-Captación y Tratamiento son **internos**; Panel y Gateway son la interfaz visible.
+Tratamiento **no** habla con el panel: solo recibe lotes y devuelve resultados a Captación.
 :::
 
 ::: {.depth-hint}
@@ -237,7 +237,7 @@ Profundización opcional ↓ — secuencia de la tubería y comparativa con enva
 :::
 
 ::: {.notes}
-Demo en vivo con modo lento. Misma agua, dos modos: cañería (gRPC) vs envases (REST).
+Demo en vivo: misma agua, dos modos de transporte interno — cañería gRPC vs envases HTTP. Un evento SSE = un lote procesado de punta a punta.
 :::
 
 ## Al abrir el grifo
@@ -253,11 +253,13 @@ sequenceDiagram
   participant TRF as Tratamiento
 
   Panel->>GW: POST /jobs
-  GW->>ING: StartPipeline
   Panel->>GW: SSE nivel
-  loop Caudal continuo
-    ING->>TRF: RawRecord
-    TRF->>GW: ProgressEvent
+  GW->>ING: RunPipeline stream
+  loop Por cada lote
+    ING->>ING: Lee chunk CSV
+    ING->>TRF: RecordBatch
+    TRF-->>ING: BatchResult
+    ING-->>GW: ProgressEvent
     GW-->>Panel: SSE
   end
 ```
@@ -267,24 +269,24 @@ sequenceDiagram
 
 ::: {.columns}
 ::: {.column width="50%"}
-**Unary** — ¿abrir válvula?
+**Server streaming** — caudal de avisos
 
-`StartPipeline`
+`RunPipeline`
 
-*«¿Iniciar caudal?» → «Sí, job_id=abc»*
+*Gateway consume un `ProgressEvent` por lote completado*
 :::
 
 ::: {.column width="50%"}
-**Client streaming** — registro a registro
+**Bidireccional** — lote a lote
 
 `TransformStream`
 
-*Caudal continuo → resumen al cerrar*
+*`RecordBatch` → `BatchResult` por cada porción*
 :::
 :::
 
 ::: {.small}
-**Sensor de nivel:** `PublishEvents` — aviso cada N registros procesados.
+Captación orquesta: lee, envía al tratamiento, acumula métricas y emite progreso al gateway.
 :::
 
 ## Un plano para todas las estaciones
@@ -293,51 +295,53 @@ Un solo `.proto` — plano de planta compartido:
 
 ```protobuf
 service IngestService {
-  rpc StartPipeline(...) returns (...);
+  rpc RunPipeline(...) returns (stream ProgressEvent);
 }
 service TransformService {
-  rpc TransformStream(stream RawRecord) returns (...);
-}
-service ProgressService {
-  rpc PublishEvents(stream ProgressEvent) returns (...);
+  rpc TransformStream(stream RecordBatch)
+      returns (stream BatchResult);
 }
 ```
 
 ::: {.small}
-Archivo: `proto/pipeline/v1/pipeline.proto`
+Archivo: `proto/pipeline/v1/pipeline.proto` — sin `ProgressService`: el progreso viaja en el stream de Captación.
 :::
 
 ## Misma agua: envases vs cañería
 
-En la UI, la pestaña REST reparte **envases** desde el browser; gRPC usa **cañería** en backend.
+**Misma orquestación** en backend; distinto conducto interno. El panel siempre usa `POST /jobs` + SSE al gateway.
 
 ::: {.mermaid-compact}
 ```{mermaid}
 flowchart LR
-  Panel[Panel] -->|"envases GET"| RI[rest-ingest]
-  Panel -->|"envases POST"| RT[rest-transform]
+  Panel[Panel] -->|"POST + SSE"| RGW[rest-gateway]
+  RGW --> RI[rest-ingest]
+  RI -->|"POST /transform"| RT[rest-transform]
+  RI -->|"POST progreso"| RGW
   RI --> CSV[(Deposito)]
 ```
 :::
 
 | Aspecto | Cañería (gRPC) | Envases (REST) |
 |---------|----------------|----------------|
-| Peticiones panel | ~2 | 1 + 2 × lotes |
-| Orquestación | Planta (backend) | Panel (browser) |
-| Progreso | Nivel en tiempo real | Tras cada envase |
+| Peticiones panel | 2 (POST + SSE) | 2 (POST + SSE) |
+| Orquestación | Captación (ingest) | Captación (rest-ingest) |
+| Tratamiento | Worker puro (bidi stream) | Worker puro (`POST /transform`) |
+| Progreso al medidor | `RunPipeline` stream | `POST /internal/progress` |
+| Diferencia clave | Protobuf + streams nativos | HTTP JSON por lote |
 
 # Demo en vivo
 
 ::: {.incremental}
 1. Levantar la planta: `docker compose up --build`
 2. Abrir el panel: **http://localhost:5173**
-3. **Modo lento** → abrir grifo (pestaña gRPC) — observa el nivel
-4. Pestaña REST → el browser **reparte envases**
+3. Pestaña **gRPC** → abrir grifo — observa el nivel por lote
+4. Pestaña **REST** → misma forma de trabajo, distinto conducto interno
 5. Tabla comparativa — mismo líquido, distinto transporte
 :::
 
 ::: {.callout-tip .callout-compact}
-Cañería: menos idas y vueltas y nivel continuo. Envases: más peticiones visibles en el panel.
+Comparación honesta: mismos roles (orquestador + worker + medidor). gRPC gana en eficiencia del conducto interno, no en quién coordina el flujo.
 :::
 
 # Takeaways
@@ -365,6 +369,7 @@ Recuerda los límites de la metáfora: gRPC también envía mensajes discretos; 
 | **gRPC** | Cañería moderna con plano `.proto` y HTTP/2 |
 | **Streaming** | Flujo continuo por la tubería |
 | **Pipeline** | Cadena de estaciones en serie |
+| **Orquestador** | Estación que coordina lectura, tratamiento y avisos (Ingest) |
 | **Gateway** | Medidor entre planta y panel |
 | **SSE** | Lectura del nivel en el panel |
 | **`.proto`** | Plano de la planta (estaciones y conexiones) |

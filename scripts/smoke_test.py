@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a quick end-to-end smoke test against local services."""
+"""Run a quick end-to-end smoke test against local gRPC services."""
 
 import json
 import os
@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_FILE = ROOT / "data" / "transactions.csv"
+DEFAULT_CHUNK_SIZE = 80_000
 
 
 def wait_for_health(url: str, timeout: float = 20.0) -> None:
@@ -26,19 +27,24 @@ def wait_for_health(url: str, timeout: float = 20.0) -> None:
     raise RuntimeError(f"Service not ready: {url}")
 
 
+def smoke_chunk_size() -> int:
+    raw = os.environ.get("SMOKE_CHUNK_SIZE", str(DEFAULT_CHUNK_SIZE))
+    return max(1, int(raw))
+
+
 def main() -> int:
+    chunk_size = smoke_chunk_size()
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT)
-    env["GATEWAY_TARGET"] = "localhost:50053"
     env["TRANSFORM_TARGET"] = "localhost:50052"
     env["INGEST_TARGET"] = "localhost:50051"
     env["DEFAULT_FILE"] = str(DATA_FILE)
 
     python = sys.executable
     procs = [
-        subprocess.Popen([python, "-m", "services.gateway.main"], env=env),
         subprocess.Popen([python, "-m", "services.transform.server"], env=env),
         subprocess.Popen([python, "-m", "services.ingest.server"], env=env),
+        subprocess.Popen([python, "-m", "services.gateway.main"], env=env),
     ]
 
     try:
@@ -46,7 +52,7 @@ def main() -> int:
         payload = json.dumps(
             {
                 "file_path": str(DATA_FILE),
-                "chunk_size": 200,
+                "chunk_size": chunk_size,
                 "sleep_ms": 0,
             }
         ).encode()
@@ -58,9 +64,9 @@ def main() -> int:
         )
         with urllib.request.urlopen(request, timeout=10) as response:
             job = json.load(response)
-        print("Started job:", job["job_id"])
+        print(f"Started job: {job['job_id']} (chunk_size={chunk_size})")
 
-        deadline = time.time() + 120
+        deadline = time.time() + 300
         while time.time() < deadline:
             with urllib.request.urlopen(
                 f"http://localhost:8080/jobs/{job['job_id']}",
@@ -73,9 +79,26 @@ def main() -> int:
                 bytes_streamed = last.get("bytes_streamed", 0)
                 if bytes_streamed <= 0:
                     raise RuntimeError("Expected bytes_streamed > 0 on completion")
-                print(f"Smoke test OK (bytes_streamed={bytes_streamed})")
+                wire_bytes_total = last.get("wire_bytes_total", 0)
+                if wire_bytes_total <= 0:
+                    raise RuntimeError("Expected wire_bytes_total > 0 on completion")
+                if wire_bytes_total >= bytes_streamed:
+                    raise RuntimeError(
+                        "Expected wire_bytes_total < bytes_streamed for typed protobuf gRPC"
+                    )
+                rows_processed = last.get("rows_processed", 0)
+                if rows_processed <= 0:
+                    raise RuntimeError("Expected rows_processed > 0 on completion")
+                chunk_total = last.get("chunk_total", 0)
+                print(
+                    f"Smoke test OK (bytes_streamed={bytes_streamed}, "
+                    f"wire_bytes_total={wire_bytes_total}, "
+                    f"wire_ratio={wire_bytes_total / bytes_streamed:.3f}, "
+                    f"rows={rows_processed}, chunk_total={chunk_total}, "
+                    f"chunk_size={chunk_size})"
+                )
                 return 0
-            time.sleep(2)
+            time.sleep(1)
 
         raise RuntimeError("Job did not complete in time")
     finally:

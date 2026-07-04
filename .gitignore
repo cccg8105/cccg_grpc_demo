@@ -33,6 +33,7 @@ htmlcov/
 .hypothesis/
 .venv
 env/
+.env/
 venv/
 ENV/
 env.bak/

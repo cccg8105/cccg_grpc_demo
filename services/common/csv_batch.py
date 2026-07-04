@@ -1,16 +1,11 @@
-"""Shared CSV helpers for gRPC ingest and REST APIs.
-
-Nota sobre diseño:
-- `count_rows` y `file_meta` escanean el archivo una sola vez para obtener metadata.
-- `read_batch` lee fila por fila desde el inicio hasta `offset + limit`.
-  Para el demo (~50k filas) el overhead de escanear desde el offset es aceptable.
-  En datasets muy grandes, una alternativa futura podría ser indexar el CSV o usar
-  formatos binarios tipo Parquet / `read_csv_batched` de Polars.
-"""
+"""Shared CSV batch reading for gRPC ingest and REST APIs."""
 
 from __future__ import annotations
 
 import csv
+import json
+import math
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -28,13 +23,7 @@ def file_meta(file_path: str) -> dict[str, int]:
 
 
 def read_batch(file_path: str, offset: int, limit: int) -> list[dict[str, str]]:
-    """Devuelve hasta `limit` filas de datos desde `offset` (base cero).
-
-    Implementación secuencial con csv.DictReader:
-    - Escanea el CSV desde el inicio saltando `offset` filas.
-    - No usa slicing en memoria ni DataFrame; O(limit) filas retenidas.
-    - Completa metadata via `file_meta` en el endpoint REST para evitar recomputos.
-    """
+    """Return up to `limit` data rows starting at zero-based `offset`."""
     if limit <= 0:
         return []
 
@@ -52,3 +41,67 @@ def read_batch(file_path: str, offset: int, limit: int) -> list[dict[str, str]]:
                 break
 
     return rows
+
+
+@dataclass
+class CsvBatch:
+    chunk_index: int
+    chunk_total: int
+    chunk_size: int
+    records: list[dict[str, str]]
+    bytes_read: int
+    total_rows_estimate: int
+    total_file_bytes: int
+    line_number_end: int
+
+
+def iter_csv_batches(file_path: str, chunk_size: int):
+    """Yield CSV rows in sequential batches (single pass over the file)."""
+    if chunk_size <= 0:
+        return
+
+    meta = file_meta(file_path)
+    total_estimate = meta["total_rows"]
+    total_file_bytes = meta["total_file_bytes"]
+    chunk_total = max(1, math.ceil(total_estimate / chunk_size)) if total_estimate else 1
+
+    records: list[dict[str, str]] = []
+    bytes_read = 0
+    chunk_index = 0
+    line_number_end = 1
+
+    with open(file_path, newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for line_number, row in enumerate(reader, start=2):
+            record = dict(row)
+            payload = json.dumps(record, ensure_ascii=True)
+            bytes_read += len(payload.encode("utf-8"))
+            records.append(record)
+            line_number_end = line_number
+
+            if len(records) >= chunk_size:
+                chunk_index += 1
+                yield CsvBatch(
+                    chunk_index=chunk_index,
+                    chunk_total=chunk_total,
+                    chunk_size=chunk_size,
+                    records=list(records),
+                    bytes_read=bytes_read,
+                    total_rows_estimate=total_estimate,
+                    total_file_bytes=total_file_bytes,
+                    line_number_end=line_number_end,
+                )
+                records = []
+
+    if records:
+        chunk_index += 1
+        yield CsvBatch(
+            chunk_index=chunk_index,
+            chunk_total=chunk_total,
+            chunk_size=chunk_size,
+            records=list(records),
+            bytes_read=bytes_read,
+            total_rows_estimate=total_estimate,
+            total_file_bytes=total_file_bytes,
+            line_number_end=line_number_end,
+        )

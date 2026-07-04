@@ -18,8 +18,8 @@ Documento de mantenimiento para desarrolladores. Explica cómo está organizado 
 
 | Modo | Patrón | Orquestación | Progreso hacia el browser |
 |------|--------|--------------|---------------------------|
-| **gRPC** | Pipeline con streaming entre contenedores | Backend (Ingest → Transform) | SSE (1 conexión persistente) |
-| **REST** | Pull por lotes HTTP/JSON | Frontend (loop `fetch`) | Actualización tras cada lote |
+| **gRPC** | Pipeline con streaming entre contenedores | Backend (Ingest orquesta) | SSE (1 conexión persistente) |
+| **REST** | Pipeline HTTP/JSON entre servicios | Backend (rest-ingest orquesta) | SSE (1 conexión persistente) |
 
 Ambos stacks comparten:
 
@@ -34,12 +34,13 @@ flowchart TB
   end
 
   subgraph grpcStack [Stack gRPC]
-    GW[gateway 8080/50053]
+    GW[gateway 8080]
     ING[ingest 50051]
     TRF[transform 50052]
   end
 
   subgraph restStack [Stack REST]
+    RGW[rest-gateway 8090]
     RI[rest-ingest 8091]
     RT[rest-transform 8092]
   end
@@ -47,11 +48,13 @@ flowchart TB
   DATA[(transactions.csv)]
 
   App --> GW
-  App --> RI
-  App --> RT
+  App --> RGW
   GW --> ING
   ING --> TRF
-  TRF --> GW
+  ING --> GW
+  RGW --> RI
+  RI --> RT
+  RI --> RGW
   ING --> DATA
   RI --> DATA
 ```
@@ -72,11 +75,12 @@ rpc_demo/
 ├── generated/                         # Stubs Python generados (no editar a mano)
 ├── services/
 │   ├── common/                        # CSV + transformación compartida
-│   ├── ingest/                        # gRPC: lectura y stream
-│   ├── transform/                     # gRPC: transformación y progreso
-│   ├── gateway/                       # HTTP/SSE + gRPC ProgressService
-│   ├── rest_ingest/                   # REST: meta + records paginados
-│   └── rest_transform/                # REST: POST /transform
+│   ├── ingest/                        # gRPC: orquestador RunPipeline
+│   ├── transform/                     # gRPC: worker bidi TransformStream
+│   ├── gateway/                       # HTTP/SSE; cliente RunPipeline
+│   ├── rest_gateway/                  # REST: jobs, SSE, progreso interno
+│   ├── rest_ingest/                   # REST: orquestador start-pipeline
+│   └── rest_transform/                # REST: worker POST /transform
 ├── frontend/                          # UI Svelte
 ├── data/transactions.csv              # Dataset de demo
 ├── scripts/                           # Generación proto/CSV, smoke tests
@@ -90,13 +94,15 @@ rpc_demo/
 |------|-----------------|
 | [`proto/pipeline/v1/pipeline.proto`](../proto/pipeline/v1/pipeline.proto) | Servicios y mensajes gRPC |
 | [`generated/`](../generated/) | `pipeline_pb2.py`, `pipeline_pb2_grpc.py` — regenerar con script |
-| [`services/ingest/server.py`](../services/ingest/server.py) | `IngestService`: lee CSV, client-stream hacia Transform |
-| [`services/transform/server.py`](../services/transform/server.py) | `TransformService`: transforma stream, publica `ProgressEvent` |
-| [`services/gateway/main.py`](../services/gateway/main.py) | REST API jobs, SSE, `ProgressService` gRPC |
-| [`services/rest_ingest/main.py`](../services/rest_ingest/main.py) | `GET /meta`, `GET /records` |
-| [`services/rest_transform/main.py`](../services/rest_transform/main.py) | `POST /transform` |
+| [`services/ingest/server.py`](../services/ingest/server.py) | `IngestService.RunPipeline`: orquesta CSV, bidi Transform, emite ProgressEvent |
+| [`services/transform/server.py`](../services/transform/server.py) | `TransformService`: worker bidi; devuelve BatchResult por lote |
+| [`services/gateway/main.py`](../services/gateway/main.py) | REST API jobs, SSE; cliente gRPC RunPipeline |
+| [`services/rest_gateway/main.py`](../services/rest_gateway/main.py) | REST API jobs, SSE, `POST /internal/progress` |
+| [`services/rest_ingest/main.py`](../services/rest_ingest/main.py) | Orquestador: start-pipeline, POST transform, POST progreso |
+| [`services/rest_transform/main.py`](../services/rest_transform/main.py) | Worker: `POST /transform` |
+| [`services/common/progress_builder.py`](../services/common/progress_builder.py) | Construcción compartida de ProgressPayload / ProgressEvent |
 | [`services/common/pipeline_utils.py`](../services/common/pipeline_utils.py) | Tipos de cambio, categorías, umbral `high_value` |
-| [`services/common/csv_batch.py`](../services/common/csv_batch.py) | `count_rows`, `file_meta`, `read_batch` |
+| [`services/common/csv_batch.py`](../services/common/csv_batch.py) | `iter_csv_batches`, `file_meta`, `count_rows` |
 | [`frontend/src/App.svelte`](../frontend/src/App.svelte) | Pestañas, controles compartidos, historial comparativo |
 | [`scripts/generate_proto.py`](../scripts/generate_proto.py) | Genera stubs desde `.proto` |
 | [`scripts/smoke_test.py`](../scripts/smoke_test.py) | E2E stack gRPC |
@@ -116,36 +122,31 @@ sequenceDiagram
   participant TRF as transform
 
   UI->>GW: POST /jobs
-  GW->>ING: StartPipeline unary
-  ING-->>GW: job_id started
+  GW->>ING: RunPipeline server stream
   GW-->>UI: job_id
 
   UI->>GW: SSE GET /jobs/id/events
 
-  par Pipeline backend
-    ING->>TRF: TransformStream client streaming
-    TRF->>GW: PublishEvents client streaming
+  loop Por lote
+    ING->>TRF: TransformStream bidi
+    TRF-->>ING: BatchResult
+    ING-->>GW: ProgressEvent
+    GW-->>UI: SSE
   end
-
-  GW-->>UI: ProgressEvent via SSE
-  TRF-->>ING: TransformSummary
-  GW-->>UI: job_complete
 ```
 
 ### Paso a paso (referencias de código)
 
-1. **Frontend** — [`GrpcTab.svelte`](../frontend/src/components/tabs/GrpcTab.svelte) llama `startJob()` en [`api.ts`](../frontend/src/components/api.ts) con `chunk_size` y `sleep_ms` (modo lento → 80 ms).
+1. **Frontend** — [`GrpcTab.svelte`](../frontend/src/lib/tabs/GrpcTab.svelte) llama `startJob()` en [`api.ts`](../frontend/src/lib/api.ts) con `chunk_size` y `sleep_ms` (modo lento → 80 ms).
 2. **Gateway** — [`main.py`](../services/gateway/main.py):
-   - `POST /jobs` → crea `job_id` en `JobHub`, lanza thread que invoca `IngestService.StartPipeline`.
+   - `POST /jobs` → crea `job_id` en `JobHub`, lanza thread que consume `IngestService.RunPipeline`.
    - `GET /jobs/{id}/events` → SSE desde cola asyncio por suscriptor.
 3. **Ingest** — [`server.py`](../services/ingest/server.py):
-   - `StartPipeline` arranca thread `_run_pipeline`.
-   - Generador lee CSV fila a fila, emite `RawRecord` por `TransformStream`.
-   - Pausa cada `chunk_size` filas si `sleep_ms > 0`.
+   - `RunPipeline` lee CSV por lotes, envía `RecordBatch` por bidi `TransformStream`.
+   - Por cada `BatchResult` recibido, emite `ProgressEvent` (`stage=batch` o `complete`).
 4. **Transform** — [`server.py`](../services/transform/server.py):
-   - Recibe stream de `RawRecord`, aplica `transform_record()`.
-   - Cada `PROGRESS_EVERY` filas llama `_emit_progress()` → gateway `PublishEvents`.
-5. **Gateway** — `ProgressServicer.PublishEvents` publica en `JobHub`; los suscriptores SSE reciben JSON.
+   - Worker puro: recibe `RecordBatch`, devuelve `BatchResult`. Sin contacto con gateway.
+5. **Gateway** — [`ingest_client.py`](../services/gateway/ingest_client.py) publica cada evento en `JobHub`.
 
 ### Contratos RPC
 
@@ -153,64 +154,75 @@ Definidos en [`pipeline.proto`](../proto/pipeline/v1/pipeline.proto):
 
 | RPC | Servicio | Tipo | Caller → Callee |
 |-----|----------|------|-----------------|
-| `StartPipeline` | IngestService | Unary | gateway → ingest |
-| `TransformStream` | TransformService | Client streaming | ingest → transform |
-| `PublishEvents` | ProgressService | Client streaming | transform → gateway |
-| `Ping` | Todos | Unary | healthchecks Docker |
+| `RunPipeline` | IngestService | Server streaming | gateway → ingest |
+| `TransformStream` | TransformService | Bidirectional streaming | ingest ↔ transform |
+| `Ping` | Ingest, Transform | Unary | healthchecks Docker |
 
 Mensajes relevantes:
 
-- `RawRecord`: fila CSV serializada + `bytes_read` acumulado + metadatos archivo.
-- `ProgressEvent`: progreso para UI (filas, USD, bytes stream, throughput).
-- `TransformSummary`: totales al cerrar el stream.
+- `TransactionRecord`: fila CSV tipada (`id`, `amount`, `currency`, `merchant`, `timestamp`).
+- `RecordBatch`: lote de filas + `bytes_read` acumulado (payload lógico JSON) + metadatos archivo.
+- `BatchResult`: resultado del transform por lote (filas, USD delta, preview).
+- `ProgressEvent`: progreso para UI (filas, USD, bytes stream, wire bytes, throughput).
 
 ---
 
 ## 4. Stack REST — flujo técnico
 
-La orquestación ocurre **en el browser**, no en el backend.
+La orquestación ocurre **en el servidor**, igual que en gRPC. El browser solo habla con `rest-gateway`.
 
 ```mermaid
 sequenceDiagram
   participant UI as RestTab
-  participant RI as rest-ingest
-  participant RT as rest-transform
+  participant GW as rest_gateway
+  participant RI as rest_ingest
+  participant RT as rest_transform
 
-  UI->>RI: GET /meta
-  RI-->>UI: total_rows, total_file_bytes
+  UI->>GW: POST /jobs
+  GW->>RI: POST /internal/start-pipeline
+  RI-->>GW: accepted (thread)
 
-  loop Por cada lote
-    UI->>RI: GET /records offset limit
-    RI-->>UI: records batch
-    UI->>RT: POST /transform
-    RT-->>UI: transformed + metricas
-    Note over UI: sleep si modo lento
+  loop Por cada lote chunk_size
+    RI->>RT: POST /transform (batch JSON)
+    RT-->>RI: TransformResponse
+    RI->>GW: POST /internal/progress
+    GW-->>UI: SSE progress event
   end
 ```
 
 ### Implementación
 
-- **Cliente loop:** [`restBatchClient.ts`](../frontend/src/components/restBatchClient.ts) — `runRestBatchPipeline()`.
-- **UI:** [`RestTab.svelte`](../frontend/src/components/tabs/RestTab.svelte).
+- **Cliente UI:** [`api.ts`](../frontend/src/lib/api.ts) — `startJob({ gatewayUrl: REST_GATEWAY_URL })`, `subscribeToJob`.
+- **UI:** [`RestTab.svelte`](../frontend/src/lib/tabs/RestTab.svelte).
 
 ### Endpoints
 
-**rest-ingest** (puerto 8091) — [`rest_ingest/main.py`](../services/rest_ingest/main.py):
+**rest-gateway** (puerto 8090) — [`rest_gateway/routes/jobs.py`](../services/rest_gateway/routes/jobs.py):
 
-| Método | Ruta | Parámetros | Respuesta clave |
+| Método | Ruta | Body / uso | Respuesta clave |
 |--------|------|------------|-----------------|
 | GET | `/health` | — | `{ status }` |
-| GET | `/meta` | `file_path` | `total_rows`, `total_file_bytes`, `response_bytes` |
-| GET | `/records` | `offset`, `limit`, `file_path` | `records[]`, `has_more`, `response_bytes` |
+| POST | `/jobs` | `file_path`, `chunk_size`, `sleep_ms` | `job_id`, `status` |
+| GET | `/jobs/{id}` | — | `status`, `last_event` |
+| GET | `/jobs/{id}/events` | SSE | eventos JSON de progreso |
+| POST | `/internal/progress` | payload alineado a `ProgressEvent` | `{ ok }` |
+
+**rest-ingest** (puerto 8091) — [`rest_ingest/main.py`](../services/rest_ingest/main.py):
+
+| Método | Ruta | Uso |
+|--------|------|-----|
+| GET | `/health` | healthcheck |
+| POST | `/internal/start-pipeline` | orquesta CSV, transform y POST progreso al gateway |
+| GET | `/meta`, `/records` | solo debug (no usa el browser) |
 
 **rest-transform** (puerto 8092) — [`rest_transform/main.py`](../services/rest_transform/main.py):
 
 | Método | Ruta | Body | Respuesta clave |
 |--------|------|------|-----------------|
 | GET | `/health` | — | `{ status }` |
-| POST | `/transform` | `{ "records": [...] }` | `transformed[]`, `rows_processed`, `total_usd_delta`, `response_bytes` |
+| POST | `/transform` | `{ "records": [...] }` | resumen del lote |
 
----
+Ver también [FLUJO_REST_GATEWAY_SSE.md](FLUJO_REST_GATEWAY_SSE.md).
 
 ## 5. Frontend — arquitectura de componentes
 
@@ -219,9 +231,8 @@ frontend/src/
 ├── App.svelte                 # Pestañas, chunkSize, slowMode, runHistory
 ├── main.js
 ├── app.css
-└── components/
-    ├── api.ts                 # Gateway: POST /jobs, EventSource SSE
-    ├── restBatchClient.ts     # Loop REST + acumulación métricas
+└── lib/
+    ├── api.ts                 # Gateway gRPC y REST: POST /jobs, EventSource SSE
     ├── runMetrics.ts          # Tipo RunMetrics, helpers comparativa
     ├── ComparisonPanel.svelte
     ├── PipelineDiagram.svelte       # Diagrama modo gRPC
@@ -242,14 +253,13 @@ frontend/src/
 | Variable | Default local | Uso |
 |----------|---------------|-----|
 | `VITE_GATEWAY_URL` | `http://localhost:8080` | Modo gRPC |
-| `VITE_REST_INGEST_URL` | `http://localhost:8091` | Modo REST ingest |
-| `VITE_REST_TRANSFORM_URL` | `http://localhost:8092` | Modo REST transform |
+| `VITE_REST_GATEWAY_URL` | `http://localhost:8090` | Modo REST equiparable |
 
 Definidas en [`docker-compose.yml`](../docker-compose.yml) para el contenedor frontend. Tras cambiarlas en Docker, reconstruir la imagen frontend.
 
 ### Controles compartidos
 
-- **Chunk size:** filas por lote (REST) / pausa de emisión (gRPC ingest).
+- **Chunk size:** filas por lote en ambos stacks; un evento SSE por lote.
 - **Modo lento:** `sleep_ms = 80` entre lotes/chunks; solo para hacer visible la demo.
 
 ---
@@ -260,10 +270,11 @@ Definidas en [`docker-compose.yml`](../docker-compose.yml) para el contenedor fr
 
 | Servicio | Puerto(s) | Variables | Default (Docker) |
 |----------|-----------|-----------|------------------|
-| gateway | 8080 HTTP, 50053 gRPC | `HTTP_PORT`, `GRPC_PORT`, `INGEST_TARGET`, `DEFAULT_FILE` | `ingest-service:50051`, `/data/transactions.csv` |
-| ingest-service | 50051 | `INGEST_PORT`, `TRANSFORM_TARGET`, `PROGRESS_EVERY` | `transform-service:50052`, `50` |
-| transform-service | 50052 | `TRANSFORM_PORT`, `GATEWAY_TARGET`, `PROGRESS_EVERY` | `gateway:50053`, `50` |
-| rest-ingest | 8091 | `HTTP_PORT`, `DEFAULT_FILE` | `/data/transactions.csv` |
+| gateway | 8080 HTTP | `HTTP_PORT`, `INGEST_TARGET`, `DEFAULT_FILE` | `ingest-service:50051`, `/data/transactions.csv` |
+| ingest-service | 50051 | `INGEST_PORT`, `TRANSFORM_TARGET` | `transform-service:50052` |
+| transform-service | 50052 | `TRANSFORM_PORT` | — |
+| rest-gateway | 8090 | `HTTP_PORT`, `REST_INGEST_URL`, `DEFAULT_FILE` | `rest-ingest:8091` |
+| rest-ingest | 8091 | `HTTP_PORT`, `DEFAULT_FILE`, `REST_TRANSFORM_URL`, `REST_GATEWAY_URL` | `rest-transform:8092`, `rest-gateway:8090` |
 | rest-transform | 8092 | `HTTP_PORT` | — |
 | common | — | `HIGH_VALUE_THRESHOLD` | `1000` (USD) |
 
@@ -271,29 +282,32 @@ Definidas en [`docker-compose.yml`](../docker-compose.yml) para el contenedor fr
 
 ```mermaid
 flowchart TD
-  GW[gateway]
   TRF[transform-service]
   ING[ingest-service]
-  RI[rest-ingest]
+  GW[gateway]
   RT[rest-transform]
+  RI[rest-ingest]
+  RGW[rest-gateway]
   FE[frontend]
 
-  GW --> TRF
   TRF --> ING
+  ING --> GW
   GW --> FE
-  RI --> FE
-  RT --> FE
+  RT --> RI
+  RI --> RGW
+  RGW --> FE
 ```
 
-- **transform** espera **gateway** (para publicar progreso).
-- **ingest** espera **transform** (destino del stream).
-- **frontend** espera gateway + rest-ingest + rest-transform healthy.
+- **ingest** espera **transform** (destino bidi stream).
+- **gateway** espera **ingest** (cliente RunPipeline).
+- **rest-ingest** espera **rest-transform**; publica progreso a **rest-gateway**.
+- **frontend** espera gateway y rest-gateway healthy.
 
 ### Red y volúmenes
 
 - Red: `grpc-net` (bridge).
 - `./data:/data:ro` en gateway, ingest y rest-ingest.
-- Solo se exponen al host: **5173**, **8080**, **8091**, **8092**. Puertos gRPC internos (50051–50053) no están mapeados al host.
+- Solo se exponen al host: **5173**, **8080**, **8090**, **8091**, **8092** (8091/8092 opcionales para debug). Puertos gRPC internos (50051–50052) no están mapeados al host.
 
 ---
 
@@ -365,9 +379,10 @@ Un cambio en reglas de negocio en `pipeline_utils.py` afecta **ambos modos** aut
 |---------|-----|
 | `count_rows(path)` | Total de filas de datos (sin header) |
 | `file_meta(path)` | `{ total_rows, total_file_bytes }` |
-| `read_batch(path, offset, limit)` | Paginación offset/limit para REST |
+| `iter_csv_batches(path, chunk_size)` | Lectura secuencial por lotes (gRPC ingest y REST pipeline) |
+| `read_batch(path, offset, limit)` | Paginación offset/limit (solo debug REST) |
 
-**Ingest gRPC** no usa `read_batch`; itera el CSV completo en un generador row-by-row (`csv.DictReader`) sin cargar el archivo en memoria como DataFrame. Si cambias el formato del CSV, revisa ambos caminos (`csv_batch.py` y el generador en `ingest/server.py`).
+**Ingest gRPC** y **rest-ingest pipeline** usan `iter_csv_batches` (una pasada). Si cambias el formato del CSV, revisa ambos caminos.
 
 ### Dataset
 
@@ -385,7 +400,7 @@ Columnas: `id, amount, currency, merchant, timestamp`.
 
 ### Tipo `RunMetrics`
 
-Definido en [`runMetrics.ts`](../frontend/src/components/runMetrics.ts):
+Definido en [`runMetrics.ts`](../frontend/src/lib/runMetrics.ts):
 
 ```typescript
 type RunMetrics = {
@@ -400,6 +415,10 @@ type RunMetrics = {
   timeToFirstUpdateMs: number;
   requestCount: number;
   bytesTransferred: number;
+  bytesPipeline: number;
+  bytesWirePipeline: number;
+  wireBytesPerBatch: number;
+  batchCount: number;
   throughputRowsPerSec: number;
   throughputBytesPerSec: number;
 };
@@ -409,19 +428,29 @@ type RunMetrics = {
 
 | Campo | gRPC | REST |
 |-------|------|------|
-| `requestCount` | 1 POST + 1 conexión SSE | 1 meta + 2 × número de lotes |
-| `bytesTransferred` | Suma tamaño JSON de cada evento SSE | Suma `response_bytes` de cada respuesta HTTP |
-| `timeToFirstUpdateMs` | Primer evento SSE (excl. `connected`) | Tras primer lote GET+POST |
-| `wallClockMs` | `performance.now()` inicio → `job_complete` | Inicio loop → fin loop |
+| `requestCount` | 1 POST + 1 conexión SSE | 1 POST + 1 conexión SSE |
+| `bytesPipeline` | `bytes_streamed` al `job_complete` (JSON acumulado ingest→transform) | Igual |
+| `bytesWirePipeline` | `wire_bytes_total` al `job_complete` (`RecordBatch.ByteSize()` acumulado) | `wire_bytes_total` (suma de `len(body)` HTTP JSON por lote) |
+| `wireBytesPerBatch` | `bytesWirePipeline / batchCount` | Igual |
+| `batchCount` | `chunk_total` al cerrar el job | Igual |
+| `bytesTransferred` | Suma JSON de cada evento SSE (solo pestaña/diagrama) | Igual |
+| `throughputBytesPerSec` | `bytesPipeline / wallClockMs` | Igual |
+| `timeToFirstUpdateMs` | Primer evento SSE (excl. `connected`) | Igual |
+| `wallClockMs` | `performance.now()` inicio → `job_complete` | Igual |
 
-Al completar un modo, `App.svelte` guarda la última ejecución por modo en `runHistory` (máx. 2 entradas). [`ComparisonPanel.svelte`](../frontend/src/components/ComparisonPanel.svelte) muestra diff REST vs gRPC cuando existen ambas.
+Al completar un modo, `App.svelte` guarda la última ejecución por modo en `runHistory` (máx. 2 entradas). [`ComparisonPanel.svelte`](../frontend/src/lib/ComparisonPanel.svelte) separa:
+
+- **Contexto común** (una columna): chunk, filas, lotes, peticiones HTTP browser, payload lógico.
+- **Tabla diferencial**: tiempos, throughput filas/s, bytes wire total y promedio por lote.
 
 ### Bytes: no confundir métricas
 
-- `bytes_streamed` (gRPC): JSON acumulado enviado Ingest → Transform.
+- `bytesPipeline` / `bytes_streamed`: payload lógico JSON de filas entre ingest y transform; **igual en ambos modos** con la misma config.
+- `bytesWirePipeline` / `wire_bytes_total`: bytes serializados ingest→transform. **gRPC**: `RecordBatch.ByteSize()` con `TransactionRecord` tipado; **REST**: body JSON HTTP. KPI comparativo de eficiencia de serialización.
+- `wire_bytes_batch`: tamaño del lote actual en el wire (eventos de progreso y diagramas).
+- `batchCount` / `chunk_total`: número de lotes `ceil(total_rows / chunk_size)`.
 - `total_file_bytes`: tamaño del CSV en disco.
-- `bytesTransferred` (UI gRPC): bytes recibidos por SSE en el browser.
-- `bytesTransferred` (UI REST): bytes de respuestas HTTP al browser.
+- `bytesTransferred` (UI): bytes SSE al navegador; no se usa en la tabla comparativa.
 
 ---
 
@@ -447,22 +476,14 @@ docker compose up --build
 
 ### Servicios sueltos (sin Docker)
 
-Terminal 1 — gateway:
+Terminal 1 — transform:
 
 ```bash
 set PYTHONPATH=%CD%
-python -m services.gateway.main
-```
-
-Terminal 2 — transform:
-
-```bash
-set PYTHONPATH=%CD%
-set GATEWAY_TARGET=localhost:50053
 python -m services.transform.server
 ```
 
-Terminal 3 — ingest:
+Terminal 2 — ingest:
 
 ```bash
 set PYTHONPATH=%CD%
@@ -470,22 +491,41 @@ set TRANSFORM_TARGET=localhost:50052
 python -m services.ingest.server
 ```
 
-Terminal 4 — rest-ingest:
+Terminal 3 — gateway:
 
 ```bash
 set PYTHONPATH=%CD%
-set DEFAULT_FILE=data\transactions.csv
-python -m services.rest_ingest.main
+set INGEST_TARGET=localhost:50051
+python -m services.gateway.main
 ```
 
-Terminal 5 — rest-transform:
+Terminal 4 — rest-transform:
 
 ```bash
 set PYTHONPATH=%CD%
 python -m services.rest_transform.main
 ```
 
-Terminal 6 — frontend:
+Terminal 5 — rest-ingest:
+
+```bash
+set PYTHONPATH=%CD%
+set DEFAULT_FILE=data\transactions.csv
+set REST_TRANSFORM_URL=http://localhost:8092
+set REST_GATEWAY_URL=http://localhost:8090
+python -m services.rest_ingest.main
+```
+
+Terminal 6 — rest-gateway:
+
+```bash
+set PYTHONPATH=%CD%
+set REST_INGEST_URL=http://localhost:8091
+set DEFAULT_FILE=data\transactions.csv
+python -m services.rest_gateway.main
+```
+
+Terminal 7 — frontend:
 
 ```bash
 cd frontend
@@ -500,7 +540,7 @@ npm run dev
 .venv/Scripts/python scripts/smoke_test_rest.py # REST end-to-end
 ```
 
-Los smoke tests levantan procesos locales, ejecutan un job completo y validan resultados (p. ej. `bytes_streamed > 0` en gRPC).
+Los smoke tests levantan procesos locales, ejecutan un job completo y validan resultados (p. ej. `bytes_streamed > 0`, `wire_bytes_total > 0` y en gRPC `wire_bytes_total < bytes_streamed`).
 
 ### Frontend build
 
@@ -518,9 +558,9 @@ cd frontend && npm run build
 |----------|---------------------|-------|
 | Añadir campo a evento de progreso UI | `pipeline.proto` → `generate_proto.py` → `transform/server.py` → `gateway/main.py` `_event_to_dict` → `api.ts` `ProgressEvent` → `GrpcTab.svelte` | Flujo completo proto → SSE → UI |
 | Cambiar reglas de transformación | `services/common/pipeline_utils.py` | Afecta gRPC y REST |
-| Cambiar frecuencia de eventos gRPC | env `PROGRESS_EVERY`, lógica en `transform/server.py` | Default: cada 50 filas |
-| Añadir endpoint REST | `rest_ingest/main.py` o `rest_transform/main.py` + `restBatchClient.ts` + opcional `RestTab.svelte` | CORS ya abierto en FastAPI |
-| Cambiar paginación CSV | `csv_batch.py` + tests manuales REST | Ingest gRPC usa iteración completa |
+| Cambiar frecuencia de eventos gRPC | `chunk_size` en POST /jobs, lógica en `transform/server.py` | Un evento SSE por lote de `chunk_size` filas |
+| Añadir endpoint REST | `rest_gateway/`, `rest_ingest/main.py` o `rest_transform/main.py` + `api.ts` si afecta al browser | CORS ya abierto en FastAPI |
+| Cambiar lectura CSV por lotes | `csv_batch.py` (`iter_csv_batches`) | Afecta gRPC ingest y REST pipeline |
 | Nueva métrica comparativa | `runMetrics.ts` + tabs que calculan + `ComparisonPanel.svelte` | |
 | Nuevo servicio en Compose | `services/<nombre>/Dockerfile`, `docker-compose.yml`, healthcheck | Copiar patrón de rest_ingest |
 | Regenerar dataset | `scripts/generate_sample_csv.py --rows N` | Montar en `/data` |
@@ -531,8 +571,8 @@ cd frontend && npm run build
 2. Ejecutar `scripts/generate_proto.py`.
 3. Poblar el campo en `TransformServicer._build_progress_event()` ([`transform/server.py`](../services/transform/server.py)).
 4. Serializar en `_event_to_dict()` ([`gateway/main.py`](../services/gateway/main.py)).
-5. Extender tipo `ProgressEvent` en [`api.ts`](../frontend/src/components/api.ts).
-6. Mostrar en [`GrpcTab.svelte`](../frontend/src/components/tabs/GrpcTab.svelte) si aplica.
+5. Extender tipo `ProgressEvent` en [`api.ts`](../frontend/src/lib/api.ts).
+6. Mostrar en [`GrpcTab.svelte`](../frontend/src/lib/tabs/GrpcTab.svelte) si aplica.
 7. `make smoke` + rebuild Docker.
 
 ### Checklist pre-PR
@@ -554,9 +594,11 @@ cd frontend && npm run build
 | `sleep_ms` / modo lento | Pausa artificial para visualizar la demo |
 | Historial comparativo en memoria | Se pierde al recargar la página |
 | Sin autenticación | Demo local |
-| Jobs gRPC no persistidos | `JobHub` es dict en memoria del gateway |
-| `bytes_streamed` ≠ tamaño CSV | Mide JSON en tránsito, no bytes en disco |
-| REST re-lee CSV por lote | `read_batch` escanea desde inicio; aceptable para demo (~50k filas) |
+| Jobs no persistidos | `JobHub` en memoria (gateway y rest-gateway) |
+| `bytes_streamed` ≠ tamaño CSV | Mide JSON en tránsito ingest→transform, no bytes en disco |
+| Tamaño máximo de lote gRPC | `MAX_CHUNK_SIZE` (80k filas) requiere `MAX_GRPC_MESSAGE_BYTES` (64 MiB) en canales/servidores gRPC; el default de gRPC es 4 MiB y rompe lotes grandes |
+
+Los límites de mensaje se centralizan en [`services/common/limits.py`](../services/common/limits.py) (`grpc_message_options()`) y se aplican en ingest, transform y gateway gRPC.
 
 No tratar estas limitaciones como bugs salvo que el alcance del proyecto cambie explícitamente.
 

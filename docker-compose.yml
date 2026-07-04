@@ -7,7 +7,6 @@ services:
     environment:
       INGEST_PORT: "50051"
       TRANSFORM_TARGET: transform-service:50052
-      PROGRESS_EVERY: "50"
     volumes:
       - ./data:/data:ro
     networks:
@@ -29,13 +28,8 @@ services:
     container_name: rpc-demo-transform
     environment:
       TRANSFORM_PORT: "50052"
-      GATEWAY_TARGET: gateway:50053
-      PROGRESS_EVERY: "50"
     networks:
       - grpc-net
-    depends_on:
-      gateway:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import grpc; from generated.pipeline.v1 import pipeline_pb2, pipeline_pb2_grpc; ch=grpc.insecure_channel('localhost:50052'); stub=pipeline_pb2_grpc.TransformServiceStub(ch); print(stub.Ping(pipeline_pb2.PingRequest()).status)"]
       interval: 10s
@@ -50,7 +44,6 @@ services:
     container_name: rpc-demo-gateway
     environment:
       HTTP_PORT: "8080"
-      GRPC_PORT: "50053"
       INGEST_TARGET: ingest-service:50051
       DEFAULT_FILE: /data/transactions.csv
     ports:
@@ -59,6 +52,9 @@ services:
       - ./data:/data:ro
     networks:
       - grpc-net
+    depends_on:
+      ingest-service:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 10s
@@ -73,8 +69,7 @@ services:
     container_name: rpc-demo-frontend
     environment:
       VITE_GATEWAY_URL: http://localhost:8080
-      VITE_REST_INGEST_URL: http://localhost:8091
-      VITE_REST_TRANSFORM_URL: http://localhost:8092
+      VITE_REST_GATEWAY_URL: http://localhost:8090
     ports:
       - "5173:5173"
     networks:
@@ -82,10 +77,33 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
+      rest-gateway:
+        condition: service_healthy
+
+  rest-gateway:
+    build:
+      context: .
+      dockerfile: services/rest_gateway/Dockerfile
+    container_name: rpc-demo-rest-gateway
+    environment:
+      HTTP_PORT: "8090"
+      REST_INGEST_URL: http://rest-ingest:8091
+      DEFAULT_FILE: /data/transactions.csv
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./data:/data:ro
+    networks:
+      - grpc-net
+    depends_on:
       rest-ingest:
         condition: service_healthy
-      rest-transform:
-        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   rest-ingest:
     build:
@@ -95,12 +113,17 @@ services:
     environment:
       HTTP_PORT: "8091"
       DEFAULT_FILE: /data/transactions.csv
+      REST_TRANSFORM_URL: http://rest-transform:8092
+      REST_GATEWAY_URL: http://rest-gateway:8090
     ports:
       - "8091:8091"
     volumes:
       - ./data:/data:ro
     networks:
       - grpc-net
+    depends_on:
+      rest-transform:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8091/health')"]
       interval: 10s

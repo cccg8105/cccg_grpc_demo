@@ -1,12 +1,12 @@
 <script lang="ts">
-  import ComparisonPanel from './components/ComparisonPanel.svelte';
-  import GrpcTab from './components/tabs/GrpcTab.svelte';
-  import RestTab from './components/tabs/RestTab.svelte';
-  import { upsertRunHistory, type RunMetrics } from './components/runMetrics';
+  import ComparisonPanel from './lib/ComparisonPanel.svelte';
+  import { MAX_CHUNK_SIZE, MIN_CHUNK_SIZE } from './lib/constants';
+  import GrpcTab from './lib/tabs/GrpcTab.svelte';
+  import RestTab from './lib/tabs/RestTab.svelte';
+  import { upsertRunHistory, type RunMetrics } from './lib/runMetrics';
 
   let activeTab = $state<'grpc' | 'rest'>('grpc');
-  let chunkSize = $state(100);
-  let slowMode = $state(true);
+  let chunkSize = $state(MAX_CHUNK_SIZE);
   let runHistory = $state<RunMetrics[]>([]);
 
   function onRunComplete(metrics: RunMetrics) {
@@ -17,22 +17,24 @@
 <main class="page">
   <header>
     <h1>Demo gRPC vs REST</h1>
-    <p>Compara pipeline gRPC con streaming frente a APIs REST por lotes orquestadas desde el browser.</p>
+    <p>Compara pipeline gRPC con pipeline REST equiparable (mismo POST + SSE, orquestación en servidor).</p>
   </header>
 
   <section class="card shared-controls">
     <div class="control-row">
       <div class="tabs">
         <button class:active={activeTab === 'grpc'} onclick={() => (activeTab = 'grpc')}>Pipeline gRPC</button>
-        <button class:active={activeTab === 'rest'} onclick={() => (activeTab = 'rest')}>API REST por lotes</button>
+        <button class:active={activeTab === 'rest'} onclick={() => (activeTab = 'rest')}>Pipeline REST</button>
       </div>
       <label>
-        <input type="checkbox" bind:checked={slowMode} />
-        Modo lento
-      </label>
-      <label>
         Chunk size
-        <input type="number" min="10" max="1000" step="10" bind:value={chunkSize} />
+        <input
+          type="number"
+          min={MIN_CHUNK_SIZE}
+          max={MAX_CHUNK_SIZE}
+          step="100"
+          bind:value={chunkSize}
+        />
       </label>
     </div>
   </section>
@@ -40,9 +42,9 @@
   <ComparisonPanel history={runHistory} />
 
   {#if activeTab === 'grpc'}
-    <GrpcTab {chunkSize} {slowMode} onComplete={onRunComplete} />
+    <GrpcTab {chunkSize} onComplete={onRunComplete} />
   {:else}
-    <RestTab {chunkSize} {slowMode} onComplete={onRunComplete} />
+    <RestTab {chunkSize} onComplete={onRunComplete} />
   {/if}
 </main>
 

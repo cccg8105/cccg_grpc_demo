@@ -152,9 +152,9 @@ flowchart TB
 | Componente | Rol en la historia |
 |------------|-------------------|
 | **Frontend (Svelte)** | Pantalla donde el usuario pulsa “Iniciar pipeline” y ve el progreso |
-| **Gateway** | Puerta de entrada HTTP para el navegador; también servidor gRPC de progreso |
-| **Ingest** | Lee el CSV por trozos (chunks) y los envía al siguiente servicio |
-| **Transform** | Convierte monedas, clasifica comercios, marca transacciones de alto valor |
+| **Gateway** | Puerta HTTP/SSE hacia el navegador; cliente gRPC de `RunPipeline` |
+| **Ingest** | Orquesta: lee CSV, coordina Transform, emite progreso al gateway |
+| **Transform** | Worker: convierte monedas, clasifica comercios, marca alto valor |
 | **transactions.csv** | Archivo de datos de ejemplo montado en el contenedor |
 
 ```mermaid
@@ -162,10 +162,9 @@ flowchart LR
   User[Usuario] --> UI[Frontend Svelte]
   UI -->|"HTTP POST /jobs"| GW[Gateway]
   UI -->|"SSE eventos en vivo"| GW
-  GW -->|"gRPC StartPipeline"| ING[Ingest]
-  ING -->|"gRPC TransformStream"| TRF[Transform]
+  GW -->|"gRPC RunPipeline stream"| ING[Ingest]
+  ING -->|"gRPC TransformStream bidi"| TRF[Transform]
   ING --> CSV[(transactions.csv)]
-  TRF -->|"gRPC PublishEvents"| GW
 ```
 
 ---
@@ -183,78 +182,80 @@ sequenceDiagram
 
   User->>UI: Clic en Iniciar pipeline
   UI->>GW: POST /jobs
-  GW->>ING: gRPC StartPipeline
-  ING-->>GW: job_id + status started
+  GW->>ING: gRPC RunPipeline stream
   GW-->>UI: job_id
 
   UI->>GW: Abre SSE /jobs/id/events
 
-  ING->>CSV: Lee filas por chunks
-  loop Por cada fila o chunk
-    ING->>TRF: RawRecord en TransformStream
-    TRF->>TRF: Transforma registro
-    TRF->>GW: ProgressEvent cada 50 filas
+  loop Por cada lote
+    ING->>CSV: Lee chunk
+    ING->>TRF: RecordBatch en TransformStream
+    TRF->>TRF: Transforma registros
+    TRF-->>ING: BatchResult
+    ING-->>GW: ProgressEvent
     GW-->>UI: Evento SSE
   end
-
-  TRF-->>ING: TransformSummary final
-  TRF->>GW: ProgressEvent job_complete
-  GW-->>UI: Evento SSE final
 ```
 
 ### Paso 1 — El frontend pide un trabajo
 
 El navegador hace `POST /jobs` con parámetros como:
 
-- `chunk_size`: cuántas filas procesar antes de una pausa opcional (útil en modo demo).
+- `chunk_size`: tamaño de **lote** para eventos de progreso hacia la UI (y pausa entre lotes en modo demo con `sleep_ms`).
 - `sleep_ms`: retardo artificial para **ver** el streaming en pantalla.
 
 El gateway genera un `job_id` único.
 
-### Paso 2 — El gateway dispara Ingest (RPC unary)
+### Paso 2 — El gateway consume RunPipeline (gRPC server stream)
 
 ```text
-StartPipeline(job_id, file_path, chunk_size, sleep_ms)
+RunPipeline(job_id, file_path, chunk_size, sleep_ms)
          ↓
-StartPipelineResponse(job_id, status="started")
+stream ProgressEvent (por lote completado)
 ```
 
-Ingest arranca en segundo plano: no bloquea la respuesta HTTP.
+El gateway mantiene el stream abierto en un thread de background mientras Ingest orquesta el pipeline.
 
-### Paso 3 — Ingest streama registros a Transform (client streaming)
+### Paso 3 — Ingest streama lotes a Transform (bidi streaming)
 
-Por cada fila del CSV, Ingest crea un mensaje `RawRecord`:
+Por cada lote de `chunk_size` filas, Ingest crea un `RecordBatch`:
 
 ```text
-RawRecord {
+RecordBatch {
   job_id,
-  line_number,
-  payload_json,      // fila del CSV en JSON
-  bytes_read,        // acumulado JSON enviado por gRPC
+  chunk_index, chunk_total,
+  records: [ TransactionRecord { id, amount, currency, merchant, timestamp }, ... ],
+  bytes_read,
   total_rows_estimate,
-  total_file_bytes   // tamaño del CSV en disco
+  total_file_bytes
 }
 ```
 
-Los envía uno tras otro por `TransformStream`. **No espera a leer las 50 000 filas** para empezar a transformar: el pipeline fluye en pipeline real.
+Los envía por `TransformStream` (bidireccional) y recibe un `BatchResult` por lote.
 
-### Paso 4 — Transform enriquece y reporta progreso
+### Paso 4 — Transform enriquece (worker puro)
 
-Por cada registro, Transform:
+Por cada registro en el lote, Transform:
 
 1. Convierte la moneda a USD (tipos de cambio fijos en la demo).
 2. Asigna categoría al comercio (retail, food, etc.).
 3. Marca `high_value` si supera un umbral.
 
-Cada 50 filas, envía un `ProgressEvent` al gateway vía `PublishEvents` (client streaming hacia el gateway). El evento incluye tanto **filas** (métrica de negocio) como **bytes** (métrica de transporte gRPC):
+Devuelve `BatchResult` a Ingest. **No** contacta al gateway.
+
+### Paso 5 — Ingest emite progreso al gateway
+
+Tras cada lote (lectura + transform), Ingest envía un `ProgressEvent` en el stream `RunPipeline`:
 
 ```text
 ProgressEvent {
+  stage: "batch" | "complete",
   rows_processed, rows_rejected, total_usd,
-  bytes_streamed,              // JSON acumulado en tránsito
-  total_file_bytes,            // tamaño del CSV en disco
+  bytes_streamed,
+  total_file_bytes,
   throughput_rows_per_sec,
-  throughput_bytes_per_sec
+  throughput_bytes_per_sec,
+  job_complete
 }
 ```
 
@@ -309,9 +310,8 @@ flowchart TB
     GW[Gateway]
     ING[Ingest]
     TRF[Transform]
-    ING <-->|gRPC| TRF
-    TRF -->|gRPC| GW
-    GW -->|gRPC| ING
+    ING <-->|gRPC bidi| TRF
+    ING -->|gRPC stream| GW
   end
 
   FE -->|"HTTP + SSE\n(facil en browser)"| GW
@@ -325,7 +325,7 @@ flowchart TB
 El gateway cumple dos roles:
 
 1. **API REST** para iniciar jobs y consultar estado.
-2. **Servidor gRPC `ProgressService`** para recibir eventos de Transform y reenviarlos al navegador.
+2. **Cliente gRPC** de `RunPipeline`: recibe eventos de Ingest y los reenvía al navegador por SSE.
 
 ---
 
@@ -334,30 +334,23 @@ El gateway cumple dos roles:
 ```mermaid
 classDiagram
   class IngestService {
-    +StartPipeline(request) response
+    +RunPipeline(request) stream ProgressEvent
     +Ping(request) response
   }
 
   class TransformService {
-    +TransformStream(stream RawRecord) TransformSummary
+    +TransformStream(stream RecordBatch) stream BatchResult
     +Ping(request) response
   }
 
-  class ProgressService {
-    +PublishEvents(stream ProgressEvent) Ack
-    +Ping(request) response
-  }
-
-  note for IngestService "Unary: dispara el pipeline"
-  note for TransformService "Client stream: recibe filas, devuelve resumen"
-  note for ProgressService "Client stream: eventos de progreso hacia UI"
+  note for IngestService "Server stream: orquesta pipeline"
+  note for TransformService "Bidi stream: worker por lote"
 ```
 
 | Servicio | Método | Tipo RPC | Quién llama a quién |
 |----------|--------|----------|---------------------|
-| `IngestService` | `StartPipeline` | Unary | Gateway → Ingest |
-| `TransformService` | `TransformStream` | Client streaming | Ingest → Transform |
-| `ProgressService` | `PublishEvents` | Client streaming | Transform → Gateway |
+| `IngestService` | `RunPipeline` | Server streaming | Gateway → Ingest |
+| `TransformService` | `TransformStream` | Bidirectional streaming | Ingest ↔ Transform |
 
 Los métodos `Ping` existen para **healthchecks**: Docker verifica que cada contenedor responde antes de considerarlo listo.
 
@@ -519,9 +512,8 @@ mindmap
       Stubs generados
       Llamadas tipadas
     Tipos de stream
-      StartPipeline unary
-      TransformStream client
-      PublishEvents client
+      RunPipeline server
+      TransformStream bidi
     Capas
       Browser HTTP SSE
       Backend gRPC
@@ -537,29 +529,31 @@ mindmap
 ## 15. Siguientes pasos de aprendizaje
 
 1. Abre [`proto/pipeline/v1/pipeline.proto`](../proto/pipeline/v1/pipeline.proto) y relaciona cada `rpc` con la secuencia del diagrama.
-2. Lee [`services/ingest/server.py`](../services/ingest/server.py) — fíjate en el generador que alimenta `TransformStream`.
-3. Lee [`services/transform/server.py`](../services/transform/server.py) — busca `_emit_progress`.
+2. Lee [`services/ingest/server.py`](../services/ingest/server.py) — orquestador `RunPipeline` y bidi `TransformStream`.
+3. Lee [`services/transform/server.py`](../services/transform/server.py) — worker que devuelve `BatchResult` por lote.
 4. Lee [`services/gateway/main.py`](../services/gateway/main.py) — combina FastAPI, SSE y el servicer gRPC.
-5. Modifica `PROGRESS_EVERY` o `chunk_size` y observa cómo cambia la experiencia en la UI.
+5. Modifica `chunk_size` y observa cómo cambia la cadencia de eventos en la UI (un evento SSE por lote).
 
 ---
 
 ## 16. Comparación REST vs gRPC (pestañas en la UI)
 
-La demo incluye un **segundo stack** para contrastar el pipeline gRPC con el patrón tradicional de **APIs REST por lotes**, orquestado desde el browser con loops `fetch`.
+La demo incluye un **segundo stack equiparable** al gRPC: mismo patrón en el navegador (`POST /jobs` + SSE), misma orquestación en servidor y mismos eventos de progreso por `chunk_size`. La diferencia que se mide es el **protocolo interno** (HTTP JSON por lote frente a gRPC `RecordBatch` en stream).
 
-### Arquitectura REST
+### Arquitectura REST equiparable
 
 ```mermaid
 flowchart LR
   UI[Frontend tab REST]
+  RGW[rest-gateway:8090]
   RING[rest-ingest:8091]
   RTRF[rest-transform:8092]
   CSV[(transactions.csv)]
 
-  UI -->|"GET /meta"| RING
-  UI -->|"loop GET /records"| RING
-  UI -->|"loop POST /transform"| RTRF
+  UI -->|"POST /jobs + SSE"| RGW
+  RGW -->|"start-pipeline"| RING
+  RING -->|"POST /transform por lote"| RTRF
+  RTRF -->|"POST /internal/progress"| RGW
   RING --> CSV
 ```
 
@@ -568,36 +562,39 @@ flowchart LR
 ```mermaid
 sequenceDiagram
   participant UI as Browser
+  participant GW as rest_gateway
   participant ING as rest_ingest
   participant TRF as rest_transform
 
-  UI->>ING: GET /meta
-  loop Por cada lote
-    UI->>ING: GET /records offset limit
-    UI->>TRF: POST /transform
-    UI->>UI: actualizar metricas
+  UI->>GW: POST /jobs
+  GW->>ING: POST /internal/start-pipeline
+  loop Por cada lote chunk_size
+    ING->>TRF: POST /transform (batch JSON)
+    TRF->>GW: POST /internal/progress
+    GW-->>UI: SSE progress event
   end
+  GW-->>UI: SSE job_complete
 ```
 
 ### Trade-offs esperados en la demo
 
-| Aspecto | Pipeline gRPC | REST por lotes |
-|---------|---------------|----------------|
-| Peticiones desde el browser | ~2 (POST + SSE) | `1 + 2 × lotes` |
-| Orquestación | Backend (Ingest → Transform) | Frontend (loop) |
-| Progreso | Push SSE | Pull tras cada lote |
-| Contrato | `.proto` tipado | JSON OpenAPI-style |
-| Bytes al browser | Eventos SSE compactos | Respuestas JSON completas por lote |
+| Aspecto | Pipeline gRPC | Pipeline REST equiparable |
+|---------|---------------|---------------------------|
+| Peticiones desde el browser | ~2 (POST + SSE) | ~2 (POST + SSE) |
+| Orquestación | Backend (gateway → ingest → transform) | Backend (rest-gateway → rest-ingest → rest-transform) |
+| Progreso | Push SSE (1 evento por lote) | Push SSE (1 evento por lote) |
+| Comunicación interna | gRPC stream `RecordBatch` (protobuf tipado) | HTTP POST JSON por lote |
+| Contrato interno | `.proto` tipado | JSON OpenAPI-style |
 
 ### Cómo usar la comparativa
 
 1. Abre http://localhost:5173
 2. Configura **chunk size** y **modo lento** (compartidos entre pestañas)
 3. Ejecuta **Pipeline gRPC** → se guardan métricas
-4. Cambia a **API REST por lotes** → ejecuta de nuevo
+4. Cambia a **Pipeline REST** → ejecuta de nuevo
 5. Revisa la **tabla comparativa** (tiempo, peticiones, bytes, filas)
 
-Interpretación didáctica: REST suele mostrar **más peticiones HTTP** y **más bytes JSON** recibidos en el browser; gRPC suele mostrar **menos round-trips** desde el cliente y progreso continuo vía SSE mientras el pipeline corre en backend.
+Interpretación didáctica: con flujos simétricos en el browser, las diferencias reflejan sobre todo **serialización y transporte entre servicios** (protobuf binario + HTTP/2 frente a JSON en HTTP/1.1), no quién orquesta el pipeline.
 
 ---
 
@@ -609,8 +606,9 @@ Interpretación didáctica: REST suele mostrar **más peticiones HTTP** y **más
 | [`proto/pipeline/v1/pipeline.proto`](../proto/pipeline/v1/pipeline.proto) | Contrato gRPC |
 | [`docker-compose.yml`](../docker-compose.yml) | Topología de contenedores |
 | [`frontend/src/App.svelte`](../frontend/src/App.svelte) | UI con pestañas gRPC/REST y comparativa |
-| [`services/rest_ingest/main.py`](../services/rest_ingest/main.py) | API REST paginada |
-| [`services/rest_transform/main.py`](../services/rest_transform/main.py) | API REST de transformación |
+| [`services/rest_gateway/main.py`](../services/rest_gateway/main.py) | REST gateway: jobs, SSE, progreso interno |
+| [`services/rest_ingest/main.py`](../services/rest_ingest/main.py) | Pipeline REST: lectura CSV secuencial por lotes |
+| [`services/rest_transform/main.py`](../services/rest_transform/main.py) | Transformación REST + progreso al gateway |
 
 ---
 

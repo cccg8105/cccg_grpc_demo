@@ -7,9 +7,10 @@ import os
 import time
 from typing import Any
 
+from generated.pipeline.v1 import pipeline_pb2
+
 
 EXCHANGE_RATES = {
-    # Tasas de cambio fijas para la demo (1 unidad de moneda -> USD)
     "USD": 1.0,
     "EUR": 1.08,
     "GBP": 1.27,
@@ -17,7 +18,6 @@ EXCHANGE_RATES = {
 }
 
 MERCHANT_CATEGORIES = {
-    # Mapeo de comercios a categorías de gasto
     "Amazon": "retail",
     "Starbucks": "food",
     "Shell": "fuel",
@@ -30,7 +30,6 @@ MERCHANT_CATEGORIES = {
     "McDonald's": "food",
 }
 
-# Umbral para marcar una transacción como de alto valor (en USD)
 HIGH_VALUE_THRESHOLD = float(os.getenv("HIGH_VALUE_THRESHOLD", "1000"))
 
 
@@ -66,3 +65,23 @@ def preview_record(record: dict[str, Any]) -> str:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def csv_row_to_proto(row: dict[str, str]) -> pipeline_pb2.TransactionRecord:
+    return pipeline_pb2.TransactionRecord(
+        id=row["id"],
+        amount=float(row["amount"]),
+        currency=row["currency"],
+        merchant=row["merchant"],
+        timestamp=row["timestamp"],
+    )
+
+
+def proto_record_to_dict(record: pipeline_pb2.TransactionRecord) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "amount": record.amount,
+        "currency": record.currency,
+        "merchant": record.merchant,
+        "timestamp": record.timestamp,
+    }

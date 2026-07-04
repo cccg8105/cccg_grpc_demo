@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke test for REST batch APIs."""
+"""Smoke test for REST gateway pipeline (POST /jobs + SSE progress)."""
 
 import json
 import os
@@ -7,14 +7,25 @@ import subprocess
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_FILE = ROOT / "data" / "transactions.csv"
-INGEST_URL = "http://localhost:8091"
-TRANSFORM_URL = "http://localhost:8092"
+GATEWAY_URL = "http://localhost:8090"
+
+
+SMOKE_CHUNK_SIZE = 80_000
+
+
+def smoke_chunk_size(data_file: Path) -> int:
+    """Use the largest allowed batch to finish quickly on big CSVs."""
+    total = 0
+    with data_file.open(encoding="utf-8") as handle:
+        next(handle, None)  # header
+        for _ in handle:
+            total += 1
+    return max(1, min(total, SMOKE_CHUNK_SIZE))
 
 
 def wait_for_health(url: str, timeout: float = 20.0) -> None:
@@ -29,75 +40,71 @@ def wait_for_health(url: str, timeout: float = 20.0) -> None:
     raise RuntimeError(f"Service not ready: {url}")
 
 
-def fetch_json(url: str, method: str = "GET", body: dict | None = None) -> dict:
-    data = None
-    headers = {}
-    if body is not None:
-        data = json.dumps(body).encode()
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
-
-
 def main() -> int:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT)
     env["DEFAULT_FILE"] = str(DATA_FILE)
+    env["REST_TRANSFORM_URL"] = "http://localhost:8092"
+    env["REST_GATEWAY_URL"] = GATEWAY_URL
+    env["REST_INGEST_URL"] = "http://localhost:8091"
 
     python = sys.executable
     procs = [
-        subprocess.Popen([python, "-m", "services.rest_ingest.main"], env=env),
         subprocess.Popen([python, "-m", "services.rest_transform.main"], env=env),
+        subprocess.Popen([python, "-m", "services.rest_ingest.main"], env=env),
+        subprocess.Popen([python, "-m", "services.rest_gateway.main"], env=env),
     ]
 
     try:
-        wait_for_health(f"{INGEST_URL}/health")
-        wait_for_health(f"{TRANSFORM_URL}/health")
-
-        file_qs = urllib.parse.urlencode({"file_path": str(DATA_FILE)})
-        meta = fetch_json(f"{INGEST_URL}/meta?{file_qs}")
-        total_rows = meta["total_rows"]
-        chunk_size = 100
-        offset = 0
-        processed = 0
-        rejected = 0
-        request_count = 1
-
-        while offset < total_rows:
-            records_qs = urllib.parse.urlencode(
-                {
-                    "offset": offset,
-                    "limit": chunk_size,
-                    "file_path": str(DATA_FILE),
-                }
-            )
-            batch = fetch_json(f"{INGEST_URL}/records?{records_qs}")
-            request_count += 1
-
-            result = fetch_json(
-                f"{TRANSFORM_URL}/transform",
-                method="POST",
-                body={"records": batch["records"]},
-            )
-            request_count += 1
-
-            processed += result["rows_processed"]
-            rejected += result["rows_rejected"]
-            offset += len(batch["records"])
-            if not batch["has_more"] or not batch["records"]:
-                break
-
-        if processed <= 0:
-            raise RuntimeError("Expected rows_processed > 0")
-        if request_count < 3:
-            raise RuntimeError("Expected multiple REST requests")
-
-        print(
-            f"REST smoke test OK processed={processed} rejected={rejected} "
-            f"requests={request_count}"
+        wait_for_health(f"{GATEWAY_URL}/health")
+        payload = json.dumps(
+            {
+                "file_path": str(DATA_FILE),
+                "chunk_size": smoke_chunk_size(DATA_FILE),
+                "sleep_ms": 0,
+            }
+        ).encode()
+        request = urllib.request.Request(
+            f"{GATEWAY_URL}/jobs",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        return 0
+        with urllib.request.urlopen(request, timeout=10) as response:
+            job = json.load(response)
+        print("Started REST job:", job["job_id"])
+
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            with urllib.request.urlopen(
+                f"{GATEWAY_URL}/jobs/{job['job_id']}",
+                timeout=10,
+            ) as response:
+                status = json.load(response)
+            print("Status:", status.get("status"), status.get("last_event", {}))
+            last = status.get("last_event") or {}
+            if last.get("job_complete"):
+                bytes_streamed = last.get("bytes_streamed", 0)
+                if bytes_streamed <= 0:
+                    raise RuntimeError("Expected bytes_streamed > 0 on completion")
+                wire_bytes_total = last.get("wire_bytes_total", 0)
+                if wire_bytes_total <= 0:
+                    raise RuntimeError("Expected wire_bytes_total > 0 on completion")
+                rows_processed = last.get("rows_processed", 0)
+                if rows_processed <= 0:
+                    raise RuntimeError("Expected rows_processed > 0 on completion")
+                chunk_total = last.get("chunk_total", 0)
+                if chunk_total <= 0:
+                    raise RuntimeError("Expected chunk_total > 0 on completion")
+                print(
+                    f"REST smoke test OK (bytes_streamed={bytes_streamed}, "
+                    f"wire_bytes_total={wire_bytes_total}, "
+                    f"rows={rows_processed}, chunk_total={chunk_total})"
+                )
+                return 0
+            time.sleep(1)
+
+        raise RuntimeError("REST job did not complete in time")
     finally:
         for proc in procs:
             proc.terminate()

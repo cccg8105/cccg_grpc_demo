@@ -1,6 +1,6 @@
 # gRPC Pipeline Demo
 
-Demo didáctica que **compara** un pipeline gRPC con streaming frente a **APIs REST por lotes** (loops desde el browser), usando el mismo CSV y la misma lógica de transformación.
+Demo didáctica que **compara** un pipeline gRPC con un pipeline REST **equiparable** (mismo `POST /jobs` + SSE en el navegador, misma semántica de `chunk_size`), usando el mismo CSV y la misma lógica de transformación.
 
 > **Guía para principiantes:** [docs/GUIA_DIDACTICA.md](docs/GUIA_DIDACTICA.md) — explicación didáctica de RPC/gRPC con diagramas Mermaid.  
 > **Documentación técnica:** [docs/DESCRIPCION_TECNICA.md](docs/DESCRIPCION_TECNICA.md) — estructura del proyecto, flujos y guía de mantenimiento para desarrolladores.  
@@ -12,10 +12,16 @@ Demo didáctica que **compara** un pipeline gRPC con streaming frente a **APIs R
 flowchart LR
   UI[SvelteFrontend] -->|POST /jobs| GW[Gateway:8080]
   UI -->|SSE /jobs/id/events| GW
-  GW -->|StartPipeline| ING[Ingest:50051]
-  ING -->|TransformStream| TRF[Transform:50052]
+  GW -->|RunPipeline stream| ING[Ingest:50051]
+  ING -->|TransformStream bidi| TRF[Transform:50052]
   ING --> DATA[(transactions.csv)]
-  TRF -->|PublishEvents| GW
+
+  UI2[RestTab] -->|POST /jobs| RGW[rest-gateway:8090]
+  UI2 -->|SSE| RGW
+  RGW --> RING[rest-ingest:8091]
+  RING -->|POST /transform| RTRF[rest-transform:8092]
+  RING -->|POST /internal/progress| RGW
+  RING --> DATA
 ```
 
 ## Requisitos
@@ -38,8 +44,8 @@ docker compose up --build
 
 Abre **http://localhost:5173**:
 
-1. Pestaña **Pipeline gRPC** — diagrama `Ingest → Transform → Gateway`, SSE en vivo
-2. Pestaña **API REST por lotes** — loop `GET /records` + `POST /transform` visible en el feed
+1. Pestaña **Pipeline gRPC** — diagrama hub gateway, SSE en vivo
+2. Pestaña **Pipeline REST** — mismo patrón browser (`POST` + SSE); HTTP interno entre servicios
 3. **Tabla comparativa** — tras ejecutar ambos modos, compara tiempo, peticiones y bytes
 
 Observa en gRPC:
@@ -53,22 +59,22 @@ Observa en gRPC:
 | Servicio | Puerto | Rol |
 |----------|--------|-----|
 | `frontend` | 5173 | UI Svelte |
-| `gateway` | 8080 | REST + SSE + gRPC ProgressService |
-| `ingest-service` | 50051 | Lee CSV y stream hacia transform |
-| `transform-service` | 50052 | Transforma registros y reporta progreso |
-| `rest-ingest` | 8091 | GET `/meta`, GET `/records` (lotes CSV) |
-| `rest-transform` | 8092 | POST `/transform` (lote JSON) |
+| `gateway` | 8080 | REST + SSE; cliente gRPC de `RunPipeline` |
+| `ingest-service` | 50051 | Orquesta CSV, transform y stream de progreso |
+| `transform-service` | 50052 | Worker: transforma lotes (bidi gRPC) |
+| `rest-gateway` | 8090 | REST + SSE (browser) |
+| `rest-ingest` | 8091 | Orquesta pipeline REST; publica progreso al gateway |
+| `rest-transform` | 8092 | Worker: `POST /transform` por lote |
 
-## API REST (modo comparación)
+## API rest-gateway (modo REST)
 
-**rest-ingest** (`8091`):
+Mismo contrato HTTP que el gateway gRPC (puerto **8090**):
 
-- `GET /meta?file_path=` — filas totales y bytes en disco
-- `GET /records?offset=&limit=&file_path=` — lote de filas CSV
+- `POST /jobs` — body: `{ "file_path", "chunk_size", "sleep_ms" }`
+- `GET /jobs/{id}/events` — SSE de eventos de progreso
+- `GET /health` — healthcheck HTTP
 
-**rest-transform** (`8092`):
-
-- `POST /transform` — body: `{ "records": [...] }`
+Endpoints internos (`rest-ingest`, `rest-transform`) no los usa el browser. Ver [docs/FLUJO_REST_GATEWAY_SSE.md](docs/FLUJO_REST_GATEWAY_SSE.md).
 
 ## API del gateway (modo gRPC)
 
@@ -84,8 +90,7 @@ Frontend sin Docker:
 cd frontend
 npm install
 VITE_GATEWAY_URL=http://localhost:8080 \
-VITE_REST_INGEST_URL=http://localhost:8091 \
-VITE_REST_TRANSFORM_URL=http://localhost:8092 \
+VITE_REST_GATEWAY_URL=http://localhost:8090 \
 npm run dev
 ```
 
@@ -126,4 +131,4 @@ make presentation-verify
 - El navegador no usa gRPC directamente; el gateway traduce eventos gRPC a SSE.
 - `sleep_ms` y **modo lento** en la UI hacen visible el streaming (~2–5 s).
 - El CSV demo tiene ~50k filas en `data/transactions.csv`.
-- **Bytes en stream** (`bytes_streamed`) mide JSON enviado entre servicios; **bytes en disco** (`total_file_bytes`) es el tamaño del CSV. Son métricas distintas y complementarias.
+- **Bytes en stream** (`bytes_streamed`) mide payload lógico JSON acumulado por fila; **bytes wire** en gRPC usa `TransactionRecord` tipado (menor que REST JSON). **Bytes en disco** (`total_file_bytes`) es el tamaño del CSV.

@@ -1,8 +1,7 @@
-"""REST transform API: batch JSON transformation for comparison demo."""
+"""REST transform API: batch JSON transformation (pure worker)."""
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from typing import Any
@@ -27,6 +26,13 @@ class TransformRequest(BaseModel):
     records: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class TransformResponse(BaseModel):
+    rows_processed: int
+    rows_rejected: int
+    total_usd_delta: float
+    record_preview: str = ""
+
+
 app = FastAPI(title="REST Transform API")
 app.add_middleware(
     CORSMiddleware,
@@ -41,9 +47,8 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/transform")
+@app.post("/transform", response_model=TransformResponse)
 async def transform_batch(body: TransformRequest):
-    transformed: list[dict[str, Any]] = []
     rows_processed = 0
     rows_rejected = 0
     total_usd_delta = 0.0
@@ -56,18 +61,14 @@ async def transform_batch(body: TransformRequest):
         else:
             rows_processed += 1
             total_usd_delta += result["amount_usd"]
-            transformed.append(result)
             last_preview = preview_record(result)
 
-    payload = {
-        "transformed": transformed,
-        "rows_processed": rows_processed,
-        "rows_rejected": rows_rejected,
-        "total_usd_delta": round(total_usd_delta, 2),
-        "record_preview": last_preview,
-    }
-    response_body = json.dumps(payload, ensure_ascii=True)
-    return {**payload, "response_bytes": len(response_body.encode("utf-8"))}
+    return TransformResponse(
+        rows_processed=rows_processed,
+        rows_rejected=rows_rejected,
+        total_usd_delta=round(total_usd_delta, 2),
+        record_preview=last_preview,
+    )
 
 
 def main() -> None:
