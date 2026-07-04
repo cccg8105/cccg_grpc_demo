@@ -1,5 +1,10 @@
 presentation/screenshots/
 
+# data
+data/
+
+generated/
+
 # Python
 __pycache__/
 *.py[cod]
